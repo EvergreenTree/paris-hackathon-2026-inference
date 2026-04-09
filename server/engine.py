@@ -6,7 +6,7 @@ import logging
 import os
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from functools import lru_cache
 from collections import defaultdict
@@ -328,6 +328,7 @@ class DataParallelHuggingFaceBackend:
     """Replicates HF backend across multiple GPUs for data-parallel serving."""
 
     def __init__(self) -> None:
+        init_t0 = time.perf_counter()
         try:
             import torch
         except Exception as exc:
@@ -342,14 +343,26 @@ class DataParallelHuggingFaceBackend:
             raise RuntimeError("no CUDA GPUs available for data-parallel backend")
 
         self.replica_count = max(1, min(requested, available_gpus))
-        self._replicas = [
-            HuggingFaceBackend(device_override=f"cuda:{idx}") for idx in range(self.replica_count)
-        ]
+        self._replicas: list[HuggingFaceBackend | None] = [None] * self.replica_count
+        # Load model replicas concurrently so all GPUs initialize in parallel.
+        with ThreadPoolExecutor(max_workers=self.replica_count, thread_name_prefix="hf-load") as load_pool:
+            future_to_idx = {
+                load_pool.submit(HuggingFaceBackend, f"cuda:{idx}"): idx for idx in range(self.replica_count)
+            }
+            for fut in as_completed(future_to_idx):
+                idx = future_to_idx[fut]
+                self._replicas[idx] = fut.result()
+
+        if any(replica is None for replica in self._replicas):
+            raise RuntimeError("failed to initialize one or more HF replicas")
+
+        self._replicas = [replica for replica in self._replicas if replica is not None]
         self._executor = ThreadPoolExecutor(max_workers=self.replica_count, thread_name_prefix="hf-replica")
         self._pending = [0 for _ in range(self.replica_count)]
         self._rr = 0
         self._lock = Lock()
-        LOG.info("Initialized data-parallel backend with %s replicas", self.replica_count)
+        init_s = time.perf_counter() - init_t0
+        LOG.info("Initialized data-parallel backend with %s replicas in %.2fs", self.replica_count, init_s)
 
     def _choose_replica_index_unlocked(self) -> int:
         # Caller must hold self._lock.
