@@ -550,6 +550,9 @@ def build_backend() -> InferenceBackend:
         except Exception as exc:
             LOG.warning("Falling back to rule-based backend: %s", exc)
             # region agent log
+            LOG.exception("Backend initialization traceback for fallback")
+            # endregion
+            # region agent log
             _debug_log(
                 run_id="pre-fix",
                 hypothesis_id="H4",
