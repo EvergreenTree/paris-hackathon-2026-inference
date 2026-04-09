@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import json
 import logging
 import os
 import re
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from functools import lru_cache
@@ -18,6 +20,32 @@ from .modeling_qwen3_5_moe import Qwen3_5MoeForCausalLM
 
 MODEL_ID = "Qwen/Qwen3.5-35B-A3B"
 LOG = logging.getLogger(__name__)
+DEBUG_LOG_PATH = "/Users/adam/Documents/Project Living Room Session/.cursor/debug-47ad21.log"
+DEBUG_SESSION_ID = "47ad21"
+
+
+def _debug_log(
+    *,
+    run_id: str,
+    hypothesis_id: str,
+    location: str,
+    message: str,
+    data: dict | None = None,
+) -> None:
+    payload = {
+        "sessionId": DEBUG_SESSION_ID,
+        "runId": run_id,
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data or {},
+        "timestamp": int(time.time() * 1000),
+    }
+    try:
+        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as fp:
+            fp.write(json.dumps(payload, ensure_ascii=True, default=str) + "\n")
+    except Exception:
+        pass
 
 
 @dataclass(slots=True)
@@ -196,6 +224,15 @@ class HuggingFaceBackend:
             import torch
             from transformers import AutoModelForCausalLM, AutoTokenizer
         except Exception as exc:
+            # region agent log
+            _debug_log(
+                run_id="pre-fix",
+                hypothesis_id="H1",
+                location="server/engine.py:HuggingFaceBackend._load_runtime:import",
+                message="torch/transformers import failed",
+                data={"error": repr(exc)},
+            )
+            # endregion
             raise RuntimeError(f"failed to import torch/transformers runtime: {exc}") from exc
 
         # Allow faster fp32 fallback ops on GPU without changing bf16 weights.
@@ -215,18 +252,55 @@ class HuggingFaceBackend:
                 device_map_target = int(self.device.split(":", 1)[1])
             except Exception:
                 device_map_target = self.device
+        # region agent log
+        _debug_log(
+            run_id="pre-fix",
+            hypothesis_id="H2",
+            location="server/engine.py:HuggingFaceBackend._load_runtime:pre-load",
+            message="starting model load",
+            data={
+                "model_id": self.model_id,
+                "tokenizer_id": self.tokenizer_id,
+                "device_env": self.device,
+                "device_map_target": str(device_map_target),
+                "dtype": self.torch_dtype,
+                "attn_impl": self.attn_impl,
+            },
+        )
+        # endregion
         config = AutoConfig.from_pretrained(self.model_id)
         config.attn_implementation = "sdpa"
 
-        self.model = Qwen3_5MoeForCausalLM.from_pretrained(
-            self.model_id,
-            config=config,
-            torch_dtype=dtype,
-            device_map={"": device_map_target},
-        )
+        try:
+            self.model = Qwen3_5MoeForCausalLM.from_pretrained(
+                self.model_id,
+                config=config,
+                torch_dtype=dtype,
+                device_map={"": device_map_target},
+            )
+        except Exception as exc:
+            # region agent log
+            _debug_log(
+                run_id="pre-fix",
+                hypothesis_id="H1",
+                location="server/engine.py:HuggingFaceBackend._load_runtime:model-load-fail",
+                message="model load failed",
+                data={"error": repr(exc), "traceback": traceback.format_exc()},
+            )
+            # endregion
+            raise
         self.model.eval()
         self._model_device = next(self.model.parameters()).device
         self.torch = torch
+        # region agent log
+        _debug_log(
+            run_id="pre-fix",
+            hypothesis_id="H2",
+            location="server/engine.py:HuggingFaceBackend._load_runtime:success",
+            message="model load succeeded",
+            data={"model_device": str(self._model_device), "attn_impl": self.attn_impl},
+        )
+        # endregion
         LOG.info(
             "Loaded model backend model_id=%s device=%s dtype=%s attn_impl=%s",
             self.model_id,
@@ -442,14 +516,48 @@ class DataParallelHuggingFaceBackend:
 
 def build_backend() -> InferenceBackend:
     backend_name = os.getenv("HACKATHON_BACKEND", "rule-based").strip().lower()
+    requested_replicas = int(os.getenv("HACKATHON_DATA_PARALLEL_REPLICAS", "0"))
+    # region agent log
+    _debug_log(
+        run_id="pre-fix",
+        hypothesis_id="H3",
+        location="server/engine.py:build_backend:entry",
+        message="build_backend called",
+        data={
+            "backend_name": backend_name,
+            "requested_replicas": requested_replicas,
+            "device": os.getenv("HACKATHON_DEVICE", ""),
+            "model_id": os.getenv("HACKATHON_MODEL_ID", MODEL_ID),
+        },
+    )
+    # endregion
     if backend_name in {"hf", "huggingface", "transformers"}:
         try:
-            requested_replicas = int(os.getenv("HACKATHON_DATA_PARALLEL_REPLICAS", "0"))
             if requested_replicas > 1:
-                return DataParallelHuggingFaceBackend()
-            return HuggingFaceBackend()
+                backend = DataParallelHuggingFaceBackend()
+            else:
+                backend = HuggingFaceBackend()
+            # region agent log
+            _debug_log(
+                run_id="pre-fix",
+                hypothesis_id="H3",
+                location="server/engine.py:build_backend:success",
+                message="backend selected",
+                data={"backend_class": backend.__class__.__name__},
+            )
+            # endregion
+            return backend
         except Exception as exc:
             LOG.warning("Falling back to rule-based backend: %s", exc)
+            # region agent log
+            _debug_log(
+                run_id="pre-fix",
+                hypothesis_id="H4",
+                location="server/engine.py:build_backend:fallback",
+                message="fallback to rule-based backend",
+                data={"error": repr(exc), "traceback": traceback.format_exc()},
+            )
+            # endregion
             return RuleBasedBackend()
     return RuleBasedBackend()
 
