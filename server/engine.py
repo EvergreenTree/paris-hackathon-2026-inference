@@ -192,8 +192,6 @@ class HuggingFaceBackend:
         self._load_runtime()
 
     def _load_runtime(self) -> None:
-<<<<<<< HEAD
-=======
         try:
             import torch
             from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -207,7 +205,6 @@ class HuggingFaceBackend:
         except Exception:
             pass
 
->>>>>>> 2c2498fd6f04518d98556150d13d393999686857
         dtype = getattr(torch, self.torch_dtype, torch.bfloat16)
         self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_id)
         if self.tokenizer.pad_token_id is None:
@@ -218,7 +215,6 @@ class HuggingFaceBackend:
                 device_map_target = int(self.device.split(":", 1)[1])
             except Exception:
                 device_map_target = self.device
-<<<<<<< HEAD
         config = AutoConfig.from_pretrained(self.model_id)
         config.attn_implementation = "sdpa"
 
@@ -228,26 +224,6 @@ class HuggingFaceBackend:
             torch_dtype=dtype,
             device_map={"": device_map_target},
         )
-=======
-        load_errors: list[str] = []
-        attn_candidates = [self.attn_impl, "sdpa", "eager"]
-        # Keep order while removing duplicates.
-        attn_candidates = list(dict.fromkeys([a for a in attn_candidates if a]))
-        for attn_impl in attn_candidates:
-            try:
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    self.model_id,
-                    torch_dtype=dtype,
-                    device_map={"": device_map_target},
-                    attn_implementation=attn_impl,
-                )
-                self.attn_impl = attn_impl
-                break
-            except Exception as exc:
-                load_errors.append(f"{attn_impl}: {exc}")
-        if self.model is None:
-            raise RuntimeError(f"failed to load model with attention impl fallbacks: {' | '.join(load_errors)}")
->>>>>>> 2c2498fd6f04518d98556150d13d393999686857
         self.model.eval()
         self._model_device = next(self.model.parameters()).device
         self.torch = torch
