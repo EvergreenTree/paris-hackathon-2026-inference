@@ -353,6 +353,12 @@ class InferenceEngine:
             "no",
         }
         self._priority_max_tokens = max(1, int(os.getenv("HACKATHON_PRIORITY_MAX_TOKENS", "256")))
+        self._shape_bucketing_enabled = os.getenv("HACKATHON_SHAPE_BUCKETING_ENABLE", "1").lower() not in {
+            "0",
+            "false",
+            "no",
+        }
+        self._shape_bucket_chars = max(128, int(os.getenv("HACKATHON_SHAPE_BUCKET_CHARS", "512")))
         self._adaptive_wait = os.getenv("HACKATHON_ADAPTIVE_BATCH_WAIT", "1").lower() not in {
             "0",
             "false",
@@ -383,6 +389,7 @@ class InferenceEngine:
             "normal_processed": 0,
             "autoscale_scale_up_events": 0,
             "autoscale_scale_down_events": 0,
+            "grouped_subbatches": 0,
         }
 
     async def start(self) -> None:
@@ -598,11 +605,24 @@ class InferenceEngine:
             return generate_batch(reqs)
         return [self._backend.generate(r) for r in reqs]
 
+    def _shape_bucket_id(self, req: EngineRequest) -> int:
+        if not self._shape_bucketing_enabled:
+            return 0
+        # Lightweight proxy for prompt token length; avoids expensive pre-tokenization
+        # in the scheduler thread while still reducing padding fragmentation.
+        total_chars = sum(len(m.get("content", "")) for m in req.messages)
+        return total_chars // self._shape_bucket_chars
+
     def _run_batch_grouped(self, reqs: list[EngineRequest]) -> list[EngineResponse]:
         """Group requests by generation config to maximize real batched execution."""
-        grouped_indices: dict[tuple[int, float, float], list[int]] = defaultdict(list)
+        grouped_indices: dict[tuple[int, float, float, int], list[int]] = defaultdict(list)
         for idx, req in enumerate(reqs):
-            key = (req.max_tokens, req.temperature, req.top_p)
+            key = (
+                req.max_tokens,
+                req.temperature,
+                req.top_p,
+                self._shape_bucket_id(req),
+            )
             grouped_indices[key].append(idx)
 
         out: list[EngineResponse | None] = [None] * len(reqs)
@@ -615,6 +635,7 @@ class InferenceEngine:
                 )
             for i, resp in zip(indices, group_responses, strict=True):
                 out[i] = resp
+            self._stats["grouped_subbatches"] += 1
 
         # By this point, every slot should be filled.
         if any(resp is None for resp in out):
@@ -646,6 +667,8 @@ class InferenceEngine:
             "adaptive_wait": self._adaptive_wait,
             "priority_enabled": self._priority_enabled,
             "priority_max_tokens": self._priority_max_tokens,
+            "shape_bucketing_enabled": self._shape_bucketing_enabled,
+            "shape_bucket_chars": self._shape_bucket_chars,
             "max_pending_requests": self._max_pending_requests,
             "queue_size": self.total_queue_size(),
             "priority_queue_size": self._priority_queue.qsize(),
