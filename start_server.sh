@@ -8,6 +8,9 @@ PID_FILE="${PID_FILE:-server.pid}"
 HEALTHCHECK_TIMEOUT_SEC="${HEALTHCHECK_TIMEOUT_SEC:-600}"
 HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:${PORT}/health}"
 PYTHON_BIN="${PYTHON_BIN:-.venv/bin/python}"
+WORKER_BASE_PORT="${HACKATHON_WORKER_BASE_PORT:-8100}"
+WORKER_PID_FILE="${WORKER_PID_FILE:-server.workers.pid}"
+WORKER_LOG_PREFIX="${WORKER_LOG_PREFIX:-server_worker}"
 
 # Hardcoded scheduler/model profile for current hackathon sprint.
 # Values can still be overridden from shell if needed.
@@ -32,6 +35,8 @@ PYTHON_BIN="${PYTHON_BIN:-.venv/bin/python}"
 : "${HACKATHON_SHAPE_BUCKET_CHARS:=512}"
 : "${HACKATHON_MAX_PENDING_REQUESTS:=4096}"
 : "${HACKATHON_OVERLOAD_WAIT_MS:=15}"
+: "${HACKATHON_PER_WORKER_COUNT:=1}"
+: "${HACKATHON_PER_WORKER_MAX_COUNT:=2}"
 
 export HACKATHON_BACKEND HACKATHON_MODEL_ID HACKATHON_DEVICE HACKATHON_DTYPE
 export HACKATHON_DATA_PARALLEL_REPLICAS
@@ -48,6 +53,17 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
   exit 1
 fi
 
+cleanup_pids() {
+  local file="$1"
+  if [[ -f "${file}" ]]; then
+    while IFS= read -r pid; do
+      [[ -n "${pid}" ]] || continue
+      kill "${pid}" >/dev/null 2>&1 || true
+    done < "${file}"
+    rm -f "${file}"
+  fi
+}
+
 if [[ -f "${PID_FILE}" ]] && kill -0 "$(cat "${PID_FILE}")" >/dev/null 2>&1; then
   echo "Server already running with PID $(cat "${PID_FILE}")"
   if curl -fsS "${HEALTH_URL}" >/dev/null 2>&1; then
@@ -63,15 +79,58 @@ if curl -fsS "${HEALTH_URL}" >/dev/null 2>&1; then
   exit 0
 fi
 
-echo "Starting with profile: backend=${HACKATHON_BACKEND} replicas=${HACKATHON_DATA_PARALLEL_REPLICAS} workers=${HACKATHON_WORKER_COUNT}-${HACKATHON_MAX_WORKER_COUNT} batch_max=${HACKATHON_BATCH_MAX_SIZE} batch_wait_ms=${HACKATHON_BATCH_WAIT_MS}"
-"${PYTHON_BIN}" -m server.app --host "${HOST}" --port "${PORT}" >"${LOG_FILE}" 2>&1 &
+cleanup_pids "${WORKER_PID_FILE}"
+rm -f "${PID_FILE}"
+
+replicas="${HACKATHON_DATA_PARALLEL_REPLICAS}"
+if [[ "${replicas}" -lt 1 ]]; then
+  replicas=1
+fi
+
+echo "Starting process-router profile: backend=${HACKATHON_BACKEND} replicas=${replicas} router_port=${PORT} worker_base_port=${WORKER_BASE_PORT}"
+touch "${WORKER_PID_FILE}"
+worker_urls=()
+for ((i = 0; i < replicas; i++)); do
+  wport=$((WORKER_BASE_PORT + i))
+  wlog="${WORKER_LOG_PREFIX}_${i}.log"
+  worker_urls+=("http://127.0.0.1:${wport}")
+  HACKATHON_DEVICE="cuda:${i}" \
+  HACKATHON_DATA_PARALLEL_REPLICAS="1" \
+  HACKATHON_WORKER_COUNT="${HACKATHON_PER_WORKER_COUNT}" \
+  HACKATHON_MAX_WORKER_COUNT="${HACKATHON_PER_WORKER_MAX_COUNT}" \
+  "${PYTHON_BIN}" -m server.app --host 127.0.0.1 --port "${wport}" >"${wlog}" 2>&1 &
+  echo "$!" >> "${WORKER_PID_FILE}"
+done
+
+for ((i = 0; i < replicas; i++)); do
+  wport=$((WORKER_BASE_PORT + i))
+  wurl="http://127.0.0.1:${wport}/health"
+  ready=0
+  for ((j = 1; j <= HEALTHCHECK_TIMEOUT_SEC; j++)); do
+    if curl -fsS "${wurl}" >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    sleep 1
+  done
+  if [[ "${ready}" -ne 1 ]]; then
+    echo "Worker ${i} failed health check at ${wurl}" >&2
+    cleanup_pids "${WORKER_PID_FILE}"
+    exit 1
+  fi
+done
+
+worker_urls_csv="$(IFS=,; echo "${worker_urls[*]}")"
+HACKATHON_ROUTER_WORKER_URLS="${worker_urls_csv}" \
+"${PYTHON_BIN}" -m server.router --host "${HOST}" --port "${PORT}" >"${LOG_FILE}" 2>&1 &
 SERVER_PID=$!
-echo "${SERVER_PID}" >"${PID_FILE}"
-echo "Started server PID ${SERVER_PID} on ${HOST}:${PORT}"
+echo "${SERVER_PID}" > "${PID_FILE}"
+echo "Started router PID ${SERVER_PID} on ${HOST}:${PORT}"
 
 for ((i = 1; i <= HEALTHCHECK_TIMEOUT_SEC; i++)); do
   if ! kill -0 "${SERVER_PID}" >/dev/null 2>&1; then
     echo "Server process exited early. Check ${LOG_FILE}" >&2
+    cleanup_pids "${WORKER_PID_FILE}"
     exit 1
   fi
   if curl -fsS "${HEALTH_URL}" >/dev/null 2>&1; then
@@ -83,5 +142,6 @@ done
 
 echo "Server failed health check within ${HEALTHCHECK_TIMEOUT_SEC}s. Check ${LOG_FILE}" >&2
 kill "${SERVER_PID}" >/dev/null 2>&1 || true
+cleanup_pids "${WORKER_PID_FILE}"
 exit 1
 
