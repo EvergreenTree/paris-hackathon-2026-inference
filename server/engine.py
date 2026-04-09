@@ -180,10 +180,12 @@ class HuggingFaceBackend:
         self.tokenizer_id = os.getenv("HACKATHON_TOKENIZER_ID", self.model_id)
         self.device = device_override or os.getenv("HACKATHON_DEVICE", "cuda")
         self.torch_dtype = os.getenv("HACKATHON_DTYPE", "bfloat16")
+        self.attn_impl = os.getenv("HACKATHON_ATTN_IMPL", "flash_attention_2")
         self.max_new_tokens_cap = int(os.getenv("HACKATHON_MAX_NEW_TOKENS_CAP", "1024"))
         self.tokenizer = None
         self.model = None
         self.torch = None
+        self._model_device = None
         self._load_runtime()
 
     def _load_runtime(self) -> None:
@@ -192,6 +194,13 @@ class HuggingFaceBackend:
             from transformers import AutoModelForCausalLM, AutoTokenizer
         except Exception as exc:
             raise RuntimeError(f"failed to import torch/transformers runtime: {exc}") from exc
+
+        # Allow faster fp32 fallback ops on GPU without changing bf16 weights.
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
 
         dtype = getattr(torch, self.torch_dtype, torch.bfloat16)
         self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_id)
@@ -203,15 +212,34 @@ class HuggingFaceBackend:
                 device_map_target = int(self.device.split(":", 1)[1])
             except Exception:
                 device_map_target = self.device
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_id,
-            torch_dtype=dtype,
-            device_map={"": device_map_target},
-            attn_implementation="sdpa",
-        )
+        load_errors: list[str] = []
+        attn_candidates = [self.attn_impl, "sdpa", "eager"]
+        # Keep order while removing duplicates.
+        attn_candidates = list(dict.fromkeys([a for a in attn_candidates if a]))
+        for attn_impl in attn_candidates:
+            try:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.model_id,
+                    torch_dtype=dtype,
+                    device_map={"": device_map_target},
+                    attn_implementation=attn_impl,
+                )
+                self.attn_impl = attn_impl
+                break
+            except Exception as exc:
+                load_errors.append(f"{attn_impl}: {exc}")
+        if self.model is None:
+            raise RuntimeError(f"failed to load model with attention impl fallbacks: {' | '.join(load_errors)}")
         self.model.eval()
+        self._model_device = next(self.model.parameters()).device
         self.torch = torch
-        LOG.info("Loaded model backend model_id=%s device=%s dtype=%s", self.model_id, self.device, self.torch_dtype)
+        LOG.info(
+            "Loaded model backend model_id=%s device=%s dtype=%s attn_impl=%s",
+            self.model_id,
+            self.device,
+            self.torch_dtype,
+            self.attn_impl,
+        )
 
     def _render_prompt(self, messages: list[dict[str, str]]) -> str:
         try:
@@ -231,8 +259,7 @@ class HuggingFaceBackend:
     def generate(self, req: EngineRequest) -> EngineResponse:
         prompt_text = self._render_prompt(req.messages)
         inputs = self.tokenizer(prompt_text, return_tensors="pt")
-        model_device = next(self.model.parameters()).device
-        inputs = {k: v.to(model_device) for k, v in inputs.items()}
+        inputs = {k: v.to(self._model_device) for k, v in inputs.items()}
 
         prompt_tokens = int(inputs["input_ids"].shape[-1])
         max_new_tokens = max(1, min(req.max_tokens, self.max_new_tokens_cap))
@@ -249,7 +276,7 @@ class HuggingFaceBackend:
         # Drop None values so generate() gets clean kwargs.
         gen_kwargs = {k: v for k, v in gen_kwargs.items() if v is not None}
 
-        with self.torch.no_grad():
+        with self.torch.inference_mode():
             output_ids = self.model.generate(**inputs, **gen_kwargs)
 
         generated_ids = output_ids[0, prompt_tokens:]
@@ -283,8 +310,7 @@ class HuggingFaceBackend:
 
         prompts = [self._render_prompt(r.messages) for r in reqs]
         inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=False)
-        model_device = next(self.model.parameters()).device
-        inputs = {k: v.to(model_device) for k, v in inputs.items()}
+        inputs = {k: v.to(self._model_device) for k, v in inputs.items()}
 
         if "attention_mask" in inputs:
             prompt_lens = inputs["attention_mask"].sum(dim=1).tolist()
@@ -304,7 +330,7 @@ class HuggingFaceBackend:
         }
         gen_kwargs = {k: v for k, v in gen_kwargs.items() if v is not None}
 
-        with self.torch.no_grad():
+        with self.torch.inference_mode():
             output_ids = self.model.generate(**inputs, **gen_kwargs)
 
         responses: list[EngineResponse] = []
