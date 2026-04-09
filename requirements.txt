@@ -61,6 +61,8 @@ dill==0.4.1
     #   evaluate
     #   lm-eval
     #   multiprocess
+einops==0.8.2
+    # via fla-core
 evaluate==0.4.6
     # via lm-eval
 fastapi==0.135.3
@@ -70,6 +72,10 @@ filelock==3.25.2
     #   datasets
     #   huggingface-hub
     #   torch
+fla-core==0.4.2
+    # via flash-linear-attention
+flash-linear-attention==0.4.2
+    # via hackathon (pyproject.toml)
 frozenlist==1.8.0
     # via
     #   aiohttp
@@ -293,7 +299,9 @@ tiktoken==0.12.0
 tokenizers==0.22.2
     # via transformers
 torch==2.11.0
-    # via hackathon (pyproject.toml)
+    # via
+    #   hackathon (pyproject.toml)
+    #   fla-core
 tqdm==4.67.3
     # via
     #   hackathon (pyproject.toml)
@@ -304,7 +312,9 @@ tqdm==4.67.3
     #   nltk
     #   transformers
 transformers==5.5.2
-    # via hackathon (pyproject.toml)
+    # via
+    #   hackathon (pyproject.toml)
+    #   flash-linear-attention
 triton==3.6.0
     # via torch
 typepy==1.3.4

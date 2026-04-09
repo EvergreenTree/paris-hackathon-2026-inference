@@ -14,6 +14,7 @@ dependencies = [
     "tabulate",
     "tqdm",
     "numpy",
+    "flash-linear-attention>=0.4.2",
 ]
 
 [project.optional-dependencies]

@@ -13,6 +13,9 @@ from collections import defaultdict
 from threading import Lock
 from typing import Literal, Protocol
 
+from transformers import AutoConfig
+from .modeling_qwen3_5_moe import Qwen3_5MoeForCausalLM
+
 MODEL_ID = "Qwen/Qwen3.5-35B-A3B"
 LOG = logging.getLogger(__name__)
 
@@ -187,12 +190,6 @@ class HuggingFaceBackend:
         self._load_runtime()
 
     def _load_runtime(self) -> None:
-        try:
-            import torch
-            from transformers import AutoModelForCausalLM, AutoTokenizer
-        except Exception as exc:
-            raise RuntimeError(f"failed to import torch/transformers runtime: {exc}") from exc
-
         dtype = getattr(torch, self.torch_dtype, torch.bfloat16)
         self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_id)
         if self.tokenizer.pad_token_id is None:
@@ -203,11 +200,14 @@ class HuggingFaceBackend:
                 device_map_target = int(self.device.split(":", 1)[1])
             except Exception:
                 device_map_target = self.device
-        self.model = AutoModelForCausalLM.from_pretrained(
+        config = AutoConfig.from_pretrained(self.model_id)
+        config.attn_implementation = "sdpa"
+
+        self.model = Qwen3_5MoeForCausalLM.from_pretrained(
             self.model_id,
+            config=config,
             torch_dtype=dtype,
             device_map={"": device_map_target},
-            attn_implementation="sdpa",
         )
         self.model.eval()
         self.torch = torch
