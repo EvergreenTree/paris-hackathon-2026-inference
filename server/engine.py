@@ -32,6 +32,8 @@ class EngineResponse:
 class InferenceBackend(Protocol):
     def generate(self, req: EngineRequest) -> EngineResponse: ...
 
+    def generate_batch(self, reqs: list[EngineRequest]) -> list[EngineResponse]: ...
+
 
 class _SafeEvaluator(ast.NodeVisitor):
     _allowed_binops = (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv)
@@ -158,6 +160,9 @@ class RuleBasedBackend:
             completion_tokens=completion_tokens,
         )
 
+    def generate_batch(self, reqs: list[EngineRequest]) -> list[EngineResponse]:
+        return [self.generate(r) for r in reqs]
+
 
 class HuggingFaceBackend:
     """Direct Transformers backend for initial real model execution."""
@@ -240,6 +245,11 @@ class HuggingFaceBackend:
             completion_tokens=completion_tokens,
         )
 
+    def generate_batch(self, reqs: list[EngineRequest]) -> list[EngineResponse]:
+        # Initial scheduler integration keeps correctness simple by processing
+        # one-by-one. This is the interface point for true batched generation.
+        return [self.generate(r) for r in reqs]
+
 
 def build_backend() -> InferenceBackend:
     backend_name = os.getenv("HACKATHON_BACKEND", "rule-based").strip().lower()
@@ -253,52 +263,118 @@ def build_backend() -> InferenceBackend:
 
 
 class InferenceEngine:
-    """Async engine scaffold with queue/worker architecture."""
+    """Async engine with configurable worker pool and micro-batching."""
 
     def __init__(self) -> None:
         self._backend: InferenceBackend = build_backend()
         self._backend_name = self._backend.__class__.__name__
+        self._worker_count = max(1, int(os.getenv("HACKATHON_WORKER_COUNT", "1")))
+        self._batch_max_size = max(1, int(os.getenv("HACKATHON_BATCH_MAX_SIZE", "8")))
+        self._batch_wait_ms = max(0.0, float(os.getenv("HACKATHON_BATCH_WAIT_MS", "2.0")))
         self._queue: asyncio.Queue[
             tuple[EngineRequest, asyncio.Future[EngineResponse]]
         ] = asyncio.Queue()
-        self._worker_task: asyncio.Task | None = None
+        self._worker_tasks: list[asyncio.Task] = []
+        self._stats = {
+            "submitted_requests": 0,
+            "processed_requests": 0,
+            "processed_batches": 0,
+            "last_batch_size": 0,
+        }
 
     async def start(self) -> None:
-        if self._worker_task is None:
-            self._worker_task = asyncio.create_task(self._worker_loop(), name="engine-worker")
+        if self._worker_tasks:
+            return
+        for i in range(self._worker_count):
+            self._worker_tasks.append(
+                asyncio.create_task(self._worker_loop(i), name=f"engine-worker-{i}")
+            )
+        LOG.info(
+            "Engine started backend=%s workers=%s batch_max=%s batch_wait_ms=%s",
+            self._backend_name,
+            self._worker_count,
+            self._batch_max_size,
+            self._batch_wait_ms,
+        )
 
     async def stop(self) -> None:
-        if self._worker_task is None:
+        if not self._worker_tasks:
             return
-        self._worker_task.cancel()
-        try:
-            await self._worker_task
-        except asyncio.CancelledError:
-            pass
-        self._worker_task = None
+        for task in self._worker_tasks:
+            task.cancel()
+        for task in self._worker_tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._worker_tasks = []
 
     async def submit(self, req: EngineRequest) -> EngineResponse:
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[EngineResponse] = loop.create_future()
+        self._stats["submitted_requests"] += 1
         await self._queue.put((req, fut))
         return await fut
 
-    async def _worker_loop(self) -> None:
+    async def _worker_loop(self, worker_idx: int) -> None:
         while True:
-            req, fut = await self._queue.get()
-            try:
-                response = self._run_request(req)
-                if not fut.done():
-                    fut.set_result(response)
-            except Exception as exc:
-                if not fut.done():
-                    fut.set_exception(exc)
-            finally:
-                self._queue.task_done()
+            first_req, first_fut = await self._queue.get()
+            batch: list[tuple[EngineRequest, asyncio.Future[EngineResponse]]] = [(first_req, first_fut)]
 
-    def _run_request(self, req: EngineRequest) -> EngineResponse:
-        return self._backend.generate(req)
+            # Drain extra requests for a tiny window to form a micro-batch.
+            while len(batch) < self._batch_max_size:
+                try:
+                    nxt = await asyncio.wait_for(
+                        self._queue.get(), timeout=self._batch_wait_ms / 1000.0
+                    )
+                    batch.append(nxt)
+                except TimeoutError:
+                    break
+
+            reqs = [r for r, _ in batch]
+            futs = [f for _, f in batch]
+            try:
+                responses = self._run_batch(reqs)
+                if len(responses) != len(batch):
+                    raise RuntimeError(
+                        f"backend returned {len(responses)} responses for batch of {len(batch)}"
+                    )
+                for fut, resp in zip(futs, responses):
+                    if not fut.done():
+                        fut.set_result(resp)
+                self._stats["processed_batches"] += 1
+                self._stats["processed_requests"] += len(batch)
+                self._stats["last_batch_size"] = len(batch)
+            except Exception as exc:
+                LOG.exception("Worker %s failed processing batch of size %s", worker_idx, len(batch))
+                for fut in futs:
+                    if not fut.done():
+                        fut.set_exception(exc)
+            finally:
+                for _ in batch:
+                    self._queue.task_done()
+
+    def _run_batch(self, reqs: list[EngineRequest]) -> list[EngineResponse]:
+        generate_batch = getattr(self._backend, "generate_batch", None)
+        if callable(generate_batch):
+            return generate_batch(reqs)
+        return [self._backend.generate(r) for r in reqs]
 
     @property
     def backend_name(self) -> str:
         return self._backend_name
+
+    @property
+    def queue_size(self) -> int:
+        return self._queue.qsize()
+
+    @property
+    def stats(self) -> dict[str, int | float | str]:
+        return {
+            **self._stats,
+            "backend": self._backend_name,
+            "worker_count": self._worker_count,
+            "batch_max_size": self._batch_max_size,
+            "batch_wait_ms": self._batch_wait_ms,
+            "queue_size": self._queue.qsize(),
+        }
