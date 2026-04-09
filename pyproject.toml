@@ -6,23 +6,26 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "aiohttp>=3.9",
-    "fastapi>=0.115",
     "lm-eval[api]>=0.4.4",
-    "transformers>=4.45",
+    "transformers>=5.0",
+    "torch>=2.11.0",
     "tabulate",
     "tqdm",
     "numpy",
-    "uvicorn>=0.32",
 ]
 
 [project.optional-dependencies]
 baseline = ["vllm>=0.8"]
+server = [
+    "accelerate>=1.8.0",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+]
 
 [tool.setuptools.packages.find]
-include = ["eval*", "server*"]
+include = ["eval*"]
 
 [project.scripts]
 check-server = "eval.check_server:main"
 run-correctness = "eval.correctness.run_correctness:main"
 run-throughput = "eval.throughput.run_throughput:main"
-run-server = "server.app:main"
