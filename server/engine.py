@@ -269,6 +269,8 @@ class HuggingFaceBackend:
         )
         # endregion
         config = AutoConfig.from_pretrained(self.model_id)
+        if hasattr(config, "text_config"):
+            config = config.text_config
         config.attn_implementation = "sdpa"
 
         try:
