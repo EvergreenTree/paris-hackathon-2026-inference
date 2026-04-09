@@ -235,8 +235,8 @@ This repo now includes a minimal OpenAI-compatible server scaffold in `server/`.
 
 ```bash
 uv venv --python 3.12
-uv pip install -e .
-.venv/bin/run-server --host 127.0.0.1 --port 8000
+uv pip install -e ".[server]"
+bash start_server.sh
 ```
 
 Health endpoint includes active backend:
@@ -255,7 +255,7 @@ export HACKATHON_BACKEND=hf
 export HACKATHON_MODEL_ID=Qwen/Qwen3.5-35B-A3B
 export HACKATHON_DEVICE=cuda
 export HACKATHON_DTYPE=bfloat16
-.venv/bin/run-server --host 0.0.0.0 --port 8000
+bash start_server.sh
 ```
 
 If runtime dependencies are unavailable, the server falls back to `RuleBasedBackend`.
