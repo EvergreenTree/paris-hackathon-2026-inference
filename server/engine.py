@@ -187,6 +187,8 @@ class HuggingFaceBackend:
 
         dtype = getattr(torch, self.torch_dtype, torch.bfloat16)
         self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_id)
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_id,
             torch_dtype=dtype,
@@ -246,9 +248,64 @@ class HuggingFaceBackend:
         )
 
     def generate_batch(self, reqs: list[EngineRequest]) -> list[EngineResponse]:
-        # Initial scheduler integration keeps correctness simple by processing
-        # one-by-one. This is the interface point for true batched generation.
-        return [self.generate(r) for r in reqs]
+        if not reqs:
+            return []
+        if len(reqs) == 1:
+            return [self.generate(reqs[0])]
+
+        # Keep behavior deterministic/correct by falling back if requests in the
+        # batch have different sampling configs or output limits.
+        first = reqs[0]
+        same_shape = all(
+            r.max_tokens == first.max_tokens
+            and abs(r.temperature - first.temperature) < 1e-9
+            and abs(r.top_p - first.top_p) < 1e-9
+            for r in reqs
+        )
+        if not same_shape:
+            return [self.generate(r) for r in reqs]
+
+        prompts = [self._render_prompt(r.messages) for r in reqs]
+        inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=False)
+        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+
+        if "attention_mask" in inputs:
+            prompt_lens = inputs["attention_mask"].sum(dim=1).tolist()
+        else:
+            prompt_lens = [int(inputs["input_ids"].shape[-1])] * len(reqs)
+
+        max_new_tokens = max(1, min(first.max_tokens, self.max_new_tokens_cap))
+        do_sample = first.temperature > 0.0
+        gen_kwargs = {
+            "max_new_tokens": max_new_tokens,
+            "do_sample": do_sample,
+            "temperature": max(first.temperature, 1e-5) if do_sample else None,
+            "top_p": first.top_p if do_sample else None,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "use_cache": True,
+        }
+        gen_kwargs = {k: v for k, v in gen_kwargs.items() if v is not None}
+
+        with self.torch.no_grad():
+            output_ids = self.model.generate(**inputs, **gen_kwargs)
+
+        responses: list[EngineResponse] = []
+        for i, req in enumerate(reqs):
+            prompt_len = int(prompt_lens[i])
+            generated_ids = output_ids[i, prompt_len:]
+            completion_tokens = int(generated_ids.shape[-1])
+            content = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+            finish_reason: Literal["stop", "length"] = "length" if completion_tokens >= max_new_tokens else "stop"
+            responses.append(
+                EngineResponse(
+                    content=content,
+                    finish_reason=finish_reason,
+                    prompt_tokens=prompt_len,
+                    completion_tokens=completion_tokens,
+                )
+            )
+        return responses
 
 
 def build_backend() -> InferenceBackend:
