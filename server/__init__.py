@@ -1,0 +1,2 @@
+"""Hackathon inference server package."""
+
