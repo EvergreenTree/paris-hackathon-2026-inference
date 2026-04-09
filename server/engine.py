@@ -274,8 +274,9 @@ class HuggingFaceBackend:
             output_ids = self.model.generate(**inputs, **gen_kwargs)
 
         generated_ids = output_ids[0, prompt_tokens:]
-        completion_tokens = int(generated_ids.shape[-1])
         content = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+        # Report completion token count on decoded text to match evaluator verification.
+        completion_tokens = len(self.tokenizer.encode(content, add_special_tokens=False))
         finish_reason: Literal["stop", "length"] = "length" if completion_tokens >= max_new_tokens else "stop"
         return EngineResponse(
             content=content,
@@ -331,8 +332,8 @@ class HuggingFaceBackend:
         for i, req in enumerate(reqs):
             prompt_len = int(prompt_lens[i])
             generated_ids = output_ids[i, prompt_len:]
-            completion_tokens = int(generated_ids.shape[-1])
             content = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+            completion_tokens = len(self.tokenizer.encode(content, add_special_tokens=False))
             finish_reason: Literal["stop", "length"] = "length" if completion_tokens >= max_new_tokens else "stop"
             responses.append(
                 EngineResponse(
