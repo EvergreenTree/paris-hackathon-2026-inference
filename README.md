@@ -227,35 +227,112 @@ baseline/
   results/                         # Baseline results
 ```
 
-## Team Server Scaffold
+## Team Implementation
 
-This repo now includes a minimal OpenAI-compatible server scaffold in `server/`.
+### Architecture Overview
 
-### Run the server locally (fallback backend)
+We built a **process-per-GPU data-parallel inference engine** with a load-balancing router. The design prioritizes high-concurrency throughput (c=32/64 carry the most scoring weight) while maintaining correctness for the GSM8K-CoT gate.
+
+```
+                    ┌──────────────────────┐
+   Client requests  │   Router (port 8000) │  FastAPI + aiohttp
+   ──────────────►  │   least-pending LB   │
+                    └──────────┬───────────┘
+                               │
+            ┌──────────────────┼──────────────────┐
+            ▼                  ▼                   ▼
+   ┌─────────────┐    ┌─────────────┐     ┌─────────────┐
+   │  Worker 0   │    │  Worker 1   │ ... │  Worker 7   │
+   │  cuda:0     │    │  cuda:1     │     │  cuda:7     │
+   │  port 8100  │    │  port 8101  │     │  port 8107  │
+   └─────────────┘    └─────────────┘     └─────────────┘
+```
+
+**Key design decisions:**
+
+1. **Process-per-GPU isolation** — Each H200 GPU runs a dedicated worker process with its own model replica. No GIL contention, no shared memory, no cross-GPU synchronization. Each worker is a complete FastAPI server with its own async request scheduler.
+
+2. **Least-pending router** — A lightweight FastAPI router on port 8000 distributes requests across workers using a least-pending policy with round-robin tiebreaking. The router passes through raw JSON responses to minimize overhead (no deserialization/reserialization).
+
+3. **Custom generation loop** — We bypass HuggingFace's `model.generate()` with a tight autoregressive loop (`_fast_generate`) that calls `model.forward()` directly. This eliminates per-step overhead from stopping criteria chains, logits processors, and beam search scaffolding. Falls back to `model.generate()` automatically if any error occurs.
+
+4. **Async micro-batch scheduler** — Each worker runs an async engine with configurable batch accumulation. Incoming requests are queued with an adaptive wait window (larger batches at high concurrency, no wait at c=1). Priority lanes ensure low-latency interactive requests aren't blocked by bulk workloads.
+
+### Optimizations
+
+| Optimization | Impact | Description |
+|---|---|---|
+| **DeltaNet fast path** | High | `causal-conv1d` + `flash-linear-attention` enable optimized CUDA kernels for the hybrid DeltaNet layers (vs. slow PyTorch fallback) |
+| **torch.compile (inductor)** | Medium | Applied to `model.forward` with `dynamic=True` for JIT-compiled CUDA kernels |
+| **Custom generation loop** | Medium | Removes HF generate() overhead (~10-20% fewer Python ops per decode step) |
+| **Startup warmup** | Reliability | 2 dummy forward passes on each GPU at startup to trigger torch.compile JIT before real requests arrive |
+| **Flash Attention auto-detect** | Medium | Automatically uses `flash_attention_2` when available, falls back to SDPA |
+| **CUDA tuning flags** | Low | TF32 matmul, cuDNN benchmark mode, dynamo cache limit=256 |
+| **Router passthrough** | Low | Raw JSON forwarding avoids Pydantic validation overhead in the router hot path |
+| **Left-pad tokenization** | Correctness | `padding_side="left"` ensures correct batch generation with varying prompt lengths |
+| **Chat template** | Correctness | `enable_thinking=False` disables thinking mode as required by hackathon rules |
+
+### File Structure
+
+```
+server/
+  app.py                  # Per-GPU worker: FastAPI server + InferenceEngine
+  router.py               # Load-balancing router across 8 workers
+  engine.py               # Async scheduler, HuggingFace backend, custom generation loop
+  models.py               # Shared Pydantic models (OpenAI-compatible request/response)
+  modeling_qwen3_5_moe.py # Qwen3.5 MoE model definition (from transformers)
+  __init__.py
+start_server.sh           # Single launch script (hackathon submission entrypoint)
+```
+
+### Quick Start (8xH200)
 
 ```bash
+# Install dependencies
 uv venv --python 3.12
 uv pip install -e ".[server]"
+
+# Optional: install causal-conv1d for DeltaNet fast path
+# (requires CUDA toolkit matching torch's CUDA version)
+pip install causal-conv1d --no-build-isolation
+
+# Launch server (starts 8 workers + 1 router)
 bash start_server.sh
 ```
 
-Health endpoint includes active backend:
+The start script:
+1. Spawns 8 worker processes (one per GPU, ports 8100-8107)
+2. Waits for all workers to pass health checks
+3. Launches the router on port 8000
+4. Exits cleanly, leaving the server running
+
+### Configuration
+
+All parameters are configurable via environment variables with sensible defaults hardcoded in `start_server.sh`:
+
+| Variable | Default | Description |
+|---|---|---|
+| `HACKATHON_BACKEND` | `hf` | Backend type (`hf` for HuggingFace, `rule-based` for scaffold) |
+| `HACKATHON_DATA_PARALLEL_REPLICAS` | `8` | Number of GPU replicas |
+| `HACKATHON_BATCH_MAX_SIZE` | `8` | Max requests per micro-batch |
+| `HACKATHON_BATCH_WAIT_MS` | `5.0` | Batch accumulation window (ms) |
+| `HACKATHON_TORCH_COMPILE` | `1` | Enable torch.compile on model.forward |
+| `HACKATHON_FAST_GENERATE` | `1` | Use custom generation loop (vs model.generate) |
+| `HACKATHON_ROUTER_POLICY` | `least_pending` | Router load-balancing policy |
+| `HACKATHON_ATTN_IMPL` | `auto` | Attention implementation (auto/flash_attention_2/sdpa) |
+
+### Verification
 
 ```bash
-curl http://127.0.0.1:8000/health
-# {"status":"ok","backend":"RuleBasedBackend"}
+# API conformance check
+python -m eval.check_server --base-url http://localhost:8000
+
+# Correctness (GSM8K-CoT, 200 problems, gate >= 87.5%)
+python -m eval.correctness.run_correctness --base-url http://localhost:8000
+
+# Full throughput sweep
+python -m eval.throughput.run_throughput --base-url http://localhost:8000
+
+# Compute final score
+python -m eval.score --correctness results/correctness.json --throughput results/throughput.json
 ```
-
-### Enable real model generation (Hugging Face backend)
-
-Set backend env vars before starting server:
-
-```bash
-export HACKATHON_BACKEND=hf
-export HACKATHON_MODEL_ID=Qwen/Qwen3.5-35B-A3B
-export HACKATHON_DEVICE=cuda
-export HACKATHON_DTYPE=bfloat16
-bash start_server.sh
-```
-
-If runtime dependencies are unavailable, the server falls back to `RuleBasedBackend`.
