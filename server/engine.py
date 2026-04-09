@@ -410,15 +410,18 @@ class HuggingFaceBackend:
 
         with self.torch.inference_mode():
             if self._use_fast_generate:
-                generated, gen_lengths = self._fast_generate(
-                    inputs["input_ids"],
-                    inputs.get("attention_mask", self.torch.ones_like(inputs["input_ids"])),
-                    max_new_tokens,
-                    do_sample,
-                    req.temperature,
-                    req.top_p,
-                )
-                return self._decode_responses(generated, gen_lengths, [prompt_tokens], max_new_tokens)[0]
+                try:
+                    generated, gen_lengths = self._fast_generate(
+                        inputs["input_ids"],
+                        inputs.get("attention_mask", self.torch.ones_like(inputs["input_ids"])),
+                        max_new_tokens,
+                        do_sample,
+                        req.temperature,
+                        req.top_p,
+                    )
+                    return self._decode_responses(generated, gen_lengths, [prompt_tokens], max_new_tokens)[0]
+                except Exception as exc:
+                    LOG.warning("_fast_generate failed, falling back to model.generate(): %s", exc)
 
             gen_kwargs = {
                 "max_new_tokens": max_new_tokens,
@@ -473,15 +476,18 @@ class HuggingFaceBackend:
 
         with self.torch.inference_mode():
             if self._use_fast_generate:
-                generated, gen_lengths = self._fast_generate(
-                    inputs["input_ids"],
-                    inputs.get("attention_mask", self.torch.ones_like(inputs["input_ids"])),
-                    max_new_tokens,
-                    do_sample,
-                    first.temperature,
-                    first.top_p,
-                )
-                return self._decode_responses(generated, gen_lengths, [int(p) for p in prompt_lens], max_new_tokens)
+                try:
+                    generated, gen_lengths = self._fast_generate(
+                        inputs["input_ids"],
+                        inputs.get("attention_mask", self.torch.ones_like(inputs["input_ids"])),
+                        max_new_tokens,
+                        do_sample,
+                        first.temperature,
+                        first.top_p,
+                    )
+                    return self._decode_responses(generated, gen_lengths, [int(p) for p in prompt_lens], max_new_tokens)
+                except Exception as exc:
+                    LOG.warning("_fast_generate batch failed, falling back to model.generate(): %s", exc)
 
             gen_kwargs = {
                 "max_new_tokens": max_new_tokens,
