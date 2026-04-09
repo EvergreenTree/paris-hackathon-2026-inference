@@ -353,6 +353,7 @@ class InferenceEngine:
             "no",
         }
         self._priority_max_tokens = max(1, int(os.getenv("HACKATHON_PRIORITY_MAX_TOKENS", "256")))
+        self._priority_burst = max(1, int(os.getenv("HACKATHON_PRIORITY_BURST", "4")))
         self._shape_bucketing_enabled = os.getenv("HACKATHON_SHAPE_BUCKETING_ENABLE", "1").lower() not in {
             "0",
             "false",
@@ -364,6 +365,7 @@ class InferenceEngine:
             "false",
             "no",
         }
+        self._overload_wait_ms = max(0.0, float(os.getenv("HACKATHON_OVERLOAD_WAIT_MS", "0.0")))
         self._priority_queue: asyncio.Queue[
             tuple[EngineRequest, asyncio.Future[EngineResponse], float, str]
         ] = asyncio.Queue()
@@ -390,7 +392,10 @@ class InferenceEngine:
             "autoscale_scale_up_events": 0,
             "autoscale_scale_down_events": 0,
             "grouped_subbatches": 0,
+            "fairness_forced_normal_turns": 0,
+            "overload_wait_recoveries": 0,
         }
+        self._priority_streak = 0
 
     async def start(self) -> None:
         if self._worker_tasks:
@@ -442,10 +447,22 @@ class InferenceEngine:
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[EngineResponse] = loop.create_future()
         if self.total_queue_size() >= self._max_pending_requests:
-            self._stats["rejected_requests"] += 1
-            raise EngineOverloadedError(
-                f"queue is full ({self.total_queue_size()}/{self._max_pending_requests})"
-            )
+            recovered = False
+            if self._overload_wait_ms > 0.0:
+                waited = 0.0
+                step_ms = 5.0
+                while waited < self._overload_wait_ms:
+                    await asyncio.sleep(step_ms / 1000.0)
+                    waited += step_ms
+                    if self.total_queue_size() < self._max_pending_requests:
+                        recovered = True
+                        self._stats["overload_wait_recoveries"] += 1
+                        break
+            if not recovered and self.total_queue_size() >= self._max_pending_requests:
+                self._stats["rejected_requests"] += 1
+                raise EngineOverloadedError(
+                    f"queue is full ({self.total_queue_size()}/{self._max_pending_requests})"
+                )
         self._stats["submitted_requests"] += 1
         lane = "priority" if self._is_priority(req) else "normal"
         if lane == "priority":
@@ -501,13 +518,27 @@ class InferenceEngine:
     async def _dequeue_once(
         self, timeout_s: float | None = None
     ) -> tuple[EngineRequest, asyncio.Future[EngineResponse], float, str] | None:
-        # Strict priority: always try priority lane first.
+        # Fairness policy: after a burst of priority picks, force one normal
+        # dequeue if available to avoid starvation.
+        if self._priority_streak >= self._priority_burst:
+            try:
+                item = self._normal_queue.get_nowait()
+                self._priority_streak = 0
+                self._stats["fairness_forced_normal_turns"] += 1
+                return item
+            except asyncio.QueueEmpty:
+                self._priority_streak = 0
+
         try:
-            return self._priority_queue.get_nowait()
+            item = self._priority_queue.get_nowait()
+            self._priority_streak += 1
+            return item
         except asyncio.QueueEmpty:
             pass
         try:
-            return self._normal_queue.get_nowait()
+            item = self._normal_queue.get_nowait()
+            self._priority_streak = 0
+            return item
         except asyncio.QueueEmpty:
             pass
 
@@ -526,7 +557,9 @@ class InferenceEngine:
                 return None
             # If both become ready, prefer priority lane.
             if priority_task in done:
+                self._priority_streak += 1
                 return priority_task.result()
+            self._priority_streak = 0
             return normal_task.result()
         finally:
             for task in (priority_task, normal_task):
@@ -667,9 +700,11 @@ class InferenceEngine:
             "adaptive_wait": self._adaptive_wait,
             "priority_enabled": self._priority_enabled,
             "priority_max_tokens": self._priority_max_tokens,
+            "priority_burst": self._priority_burst,
             "shape_bucketing_enabled": self._shape_bucketing_enabled,
             "shape_bucket_chars": self._shape_bucket_chars,
             "max_pending_requests": self._max_pending_requests,
+            "overload_wait_ms": self._overload_wait_ms,
             "queue_size": self.total_queue_size(),
             "priority_queue_size": self._priority_queue.qsize(),
             "normal_queue_size": self._normal_queue.qsize(),
