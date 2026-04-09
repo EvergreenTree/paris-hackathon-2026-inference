@@ -9,6 +9,8 @@ dependencies = [
     "lm-eval[api]>=0.4.4",
     "transformers>=5.0",
     "torch>=2.11.0",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
     "tabulate",
     "tqdm",
     "numpy",
@@ -18,8 +20,6 @@ dependencies = [
 baseline = ["vllm>=0.8"]
 server = [
     "accelerate>=1.8.0",
-    "fastapi>=0.115",
-    "uvicorn>=0.30",
 ]
 
 [tool.setuptools.packages.find]

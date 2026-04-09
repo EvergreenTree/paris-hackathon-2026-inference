@@ -20,3 +20,6 @@ baseline/results/correctness_raw/
 
 # Prompts (generated but committed)
 # eval/throughput/prompts.json
+
+*.log
+*.pid
