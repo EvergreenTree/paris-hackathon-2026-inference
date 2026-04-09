@@ -8,7 +8,7 @@ from typing import Literal
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from server.engine import EngineRequest, InferenceEngine
+from server.engine import EngineOverloadedError, EngineRequest, InferenceEngine
 
 MODEL_ID = "Qwen/Qwen3.5-35B-A3B"
 
@@ -86,7 +86,10 @@ async def chat_completions(req: ChatCompletionRequest) -> ChatCompletionResponse
         temperature=req.temperature,
         top_p=req.top_p,
     )
-    engine_resp = await app.state.engine.submit(engine_req)
+    try:
+        engine_resp = await app.state.engine.submit(engine_req)
+    except EngineOverloadedError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     choice = ChatChoice(
         index=0,

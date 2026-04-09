@@ -37,6 +37,10 @@ class InferenceBackend(Protocol):
     def generate_batch(self, reqs: list[EngineRequest]) -> list[EngineResponse]: ...
 
 
+class EngineOverloadedError(RuntimeError):
+    """Raised when the engine queue is full and cannot accept more requests."""
+
+
 class _SafeEvaluator(ast.NodeVisitor):
     _allowed_binops = (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv)
     _allowed_unary = (ast.UAdd, ast.USub)
@@ -330,13 +334,23 @@ class InferenceEngine:
         self._worker_count = max(1, int(os.getenv("HACKATHON_WORKER_COUNT", "1")))
         self._batch_max_size = max(1, int(os.getenv("HACKATHON_BATCH_MAX_SIZE", "8")))
         self._batch_wait_ms = max(0.0, float(os.getenv("HACKATHON_BATCH_WAIT_MS", "2.0")))
+        self._max_pending_requests = max(1, int(os.getenv("HACKATHON_MAX_PENDING_REQUESTS", "4096")))
+        self._priority_enabled = os.getenv("HACKATHON_PRIORITY_ENABLE", "1").lower() not in {
+            "0",
+            "false",
+            "no",
+        }
+        self._priority_max_tokens = max(1, int(os.getenv("HACKATHON_PRIORITY_MAX_TOKENS", "256")))
         self._adaptive_wait = os.getenv("HACKATHON_ADAPTIVE_BATCH_WAIT", "1").lower() not in {
             "0",
             "false",
             "no",
         }
-        self._queue: asyncio.Queue[
-            tuple[EngineRequest, asyncio.Future[EngineResponse], float]
+        self._priority_queue: asyncio.Queue[
+            tuple[EngineRequest, asyncio.Future[EngineResponse], float, str]
+        ] = asyncio.Queue()
+        self._normal_queue: asyncio.Queue[
+            tuple[EngineRequest, asyncio.Future[EngineResponse], float, str]
         ] = asyncio.Queue()
         self._worker_tasks: list[asyncio.Task] = []
         self._stats = {
@@ -349,6 +363,11 @@ class InferenceEngine:
             "total_backend_exec_ms": 0.0,
             "avg_queue_wait_ms": 0.0,
             "avg_backend_exec_ms": 0.0,
+            "rejected_requests": 0,
+            "priority_enqueued": 0,
+            "normal_enqueued": 0,
+            "priority_processed": 0,
+            "normal_processed": 0,
         }
 
     async def start(self) -> None:
@@ -379,11 +398,31 @@ class InferenceEngine:
                 pass
         self._worker_tasks = []
 
+    def _is_priority(self, req: EngineRequest) -> bool:
+        if not self._priority_enabled:
+            return False
+        # Heuristic: likely interactive decode requests should get low queueing latency.
+        return req.temperature <= 0.0 and req.max_tokens <= self._priority_max_tokens
+
+    def total_queue_size(self) -> int:
+        return self._priority_queue.qsize() + self._normal_queue.qsize()
+
     async def submit(self, req: EngineRequest) -> EngineResponse:
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[EngineResponse] = loop.create_future()
+        if self.total_queue_size() >= self._max_pending_requests:
+            self._stats["rejected_requests"] += 1
+            raise EngineOverloadedError(
+                f"queue is full ({self.total_queue_size()}/{self._max_pending_requests})"
+            )
         self._stats["submitted_requests"] += 1
-        await self._queue.put((req, fut, time.perf_counter()))
+        lane = "priority" if self._is_priority(req) else "normal"
+        if lane == "priority":
+            self._stats["priority_enqueued"] += 1
+            await self._priority_queue.put((req, fut, time.perf_counter(), lane))
+        else:
+            self._stats["normal_enqueued"] += 1
+            await self._normal_queue.put((req, fut, time.perf_counter(), lane))
         return await fut
 
     def _next_batch_timeout_s(self) -> float:
@@ -392,45 +431,72 @@ class InferenceEngine:
             return 0.0
         if not self._adaptive_wait:
             return self._batch_wait_ms / 1000.0
-        q = self._queue.qsize()
+        q = self.total_queue_size()
         if q >= self._batch_max_size:
             return 0.0
         if q <= 1:
             return self._batch_wait_ms / 1000.0
         return (self._batch_wait_ms / 2.0) / 1000.0
 
+    async def _dequeue_once(
+        self, timeout_s: float | None = None
+    ) -> tuple[EngineRequest, asyncio.Future[EngineResponse], float, str] | None:
+        # Strict priority: always try priority lane first.
+        try:
+            return self._priority_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+        try:
+            return self._normal_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+
+        if timeout_s is not None and timeout_s <= 0.0:
+            return None
+
+        priority_task = asyncio.create_task(self._priority_queue.get())
+        normal_task = asyncio.create_task(self._normal_queue.get())
+        try:
+            done, pending = await asyncio.wait(
+                {priority_task, normal_task},
+                timeout=timeout_s,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                return None
+            # If both become ready, prefer priority lane.
+            if priority_task in done:
+                return priority_task.result()
+            return normal_task.result()
+        finally:
+            for task in (priority_task, normal_task):
+                if not task.done():
+                    task.cancel()
+            for task in pending if "pending" in locals() else []:
+                if not task.done():
+                    task.cancel()
+
     async def _worker_loop(self, worker_idx: int) -> None:
         while True:
-            first_req, first_fut, first_enqueued_at = await self._queue.get()
-            batch: list[tuple[EngineRequest, asyncio.Future[EngineResponse], float]] = [
-                (first_req, first_fut, first_enqueued_at)
-            ]
+            first = await self._dequeue_once(timeout_s=None)
+            if first is None:
+                continue
+            batch: list[tuple[EngineRequest, asyncio.Future[EngineResponse], float, str]] = [first]
 
             # Drain extra requests for a tiny window to form a micro-batch.
             while len(batch) < self._batch_max_size:
                 try:
                     timeout_s = self._next_batch_timeout_s()
-                    if timeout_s <= 0.0:
-                        nxt = self._queue.get_nowait()
-                    else:
-                        nxt = await asyncio.wait_for(self._queue.get(), timeout=timeout_s)
+                    nxt = await self._dequeue_once(timeout_s=timeout_s)
+                    if nxt is None:
+                        break
                     batch.append(nxt)
-                except asyncio.QueueEmpty:
-                    break
-                except TimeoutError:
-                    break
-                except asyncio.TimeoutError:
-                    break
                 except Exception:
-                    # Keep worker resilient on edge timeout behavior.
-                    nxt = await asyncio.wait_for(
-                        self._queue.get(), timeout=self._batch_wait_ms / 1000.0
-                    )
-                    batch.append(nxt)
+                    break
 
-            reqs = [r for r, _, _ in batch]
-            futs = [f for _, f, _ in batch]
-            enqueue_times = [ts for _, _, ts in batch]
+            reqs = [r for r, _, _, _ in batch]
+            futs = [f for _, f, _, _ in batch]
+            enqueue_times = [ts for _, _, ts, _ in batch]
             try:
                 now = time.perf_counter()
                 queue_wait_ms = sum((now - ts) * 1000.0 for ts in enqueue_times)
@@ -450,6 +516,8 @@ class InferenceEngine:
                 self._stats["max_batch_size_seen"] = max(
                     int(self._stats["max_batch_size_seen"]), len(batch)
                 )
+                self._stats["priority_processed"] += sum(1 for _, _, _, lane in batch if lane == "priority")
+                self._stats["normal_processed"] += sum(1 for _, _, _, lane in batch if lane == "normal")
                 self._stats["total_queue_wait_ms"] += queue_wait_ms
                 self._stats["total_backend_exec_ms"] += backend_exec_ms
                 processed_batches = max(1, int(self._stats["processed_batches"]))
@@ -465,8 +533,11 @@ class InferenceEngine:
                     if not fut.done():
                         fut.set_exception(exc)
             finally:
-                for _ in batch:
-                    self._queue.task_done()
+                for _, _, _, lane in batch:
+                    if lane == "priority":
+                        self._priority_queue.task_done()
+                    else:
+                        self._normal_queue.task_done()
 
     def _run_batch(self, reqs: list[EngineRequest]) -> list[EngineResponse]:
         generate_batch = getattr(self._backend, "generate_batch", None)
@@ -503,7 +574,7 @@ class InferenceEngine:
 
     @property
     def queue_size(self) -> int:
-        return self._queue.qsize()
+        return self.total_queue_size()
 
     @property
     def stats(self) -> dict[str, int | float | str]:
@@ -514,5 +585,10 @@ class InferenceEngine:
             "batch_max_size": self._batch_max_size,
             "batch_wait_ms": self._batch_wait_ms,
             "adaptive_wait": self._adaptive_wait,
-            "queue_size": self._queue.qsize(),
+            "priority_enabled": self._priority_enabled,
+            "priority_max_tokens": self._priority_max_tokens,
+            "max_pending_requests": self._max_pending_requests,
+            "queue_size": self.total_queue_size(),
+            "priority_queue_size": self._priority_queue.qsize(),
+            "normal_queue_size": self._normal_queue.qsize(),
         }
