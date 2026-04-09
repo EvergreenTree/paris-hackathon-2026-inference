@@ -58,7 +58,14 @@ class ModelConfig:
 
         # Llama/Qwen: rope_theta is a direct attr; Mistral: it's inside rope_scaling dict
         rope_scaling = getattr(config, "rope_scaling", None)
-        rope_theta = getattr(config, "rope_theta", None) or rope_scaling["rope_theta"]
+        rope_theta = getattr(config, "rope_theta", None) or (
+            rope_scaling["rope_theta"] if rope_scaling and "rope_theta" in rope_scaling else 10000.0
+        )
+        intermediate_size = getattr(
+            config,
+            "intermediate_size",
+            getattr(config, "moe_intermediate_size", 0),
+        )
 
         return cls(
             num_layers=config.num_hidden_layers,
@@ -67,7 +74,7 @@ class ModelConfig:
             head_dim=head_dim,
             hidden_size=config.hidden_size,
             vocab_size=config.vocab_size,
-            intermediate_size=config.intermediate_size,
+            intermediate_size=intermediate_size,
             hidden_act=config.hidden_act,
             rms_norm_eps=config.rms_norm_eps,
             tie_word_embeddings=tie_word_embeddings,
