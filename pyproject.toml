@@ -15,13 +15,15 @@ dependencies = [
     "tqdm",
     "numpy",
     "flash-linear-attention>=0.4.2",
-    "causal-conv1d>=1.2.0",
 ]
 
 [project.optional-dependencies]
 baseline = ["vllm>=0.8"]
 server = [
     "accelerate>=1.8.0",
+]
+fast = [
+    "causal-conv1d>=1.2.0",
 ]
 
 [tool.setuptools.packages.find]
