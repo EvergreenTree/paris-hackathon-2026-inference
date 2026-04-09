@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from transformers. import initialization as init
+from transformers import initialization as init
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
