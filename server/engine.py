@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from functools import lru_cache
 from collections import defaultdict
@@ -329,8 +330,13 @@ class InferenceEngine:
         self._worker_count = max(1, int(os.getenv("HACKATHON_WORKER_COUNT", "1")))
         self._batch_max_size = max(1, int(os.getenv("HACKATHON_BATCH_MAX_SIZE", "8")))
         self._batch_wait_ms = max(0.0, float(os.getenv("HACKATHON_BATCH_WAIT_MS", "2.0")))
+        self._adaptive_wait = os.getenv("HACKATHON_ADAPTIVE_BATCH_WAIT", "1").lower() not in {
+            "0",
+            "false",
+            "no",
+        }
         self._queue: asyncio.Queue[
-            tuple[EngineRequest, asyncio.Future[EngineResponse]]
+            tuple[EngineRequest, asyncio.Future[EngineResponse], float]
         ] = asyncio.Queue()
         self._worker_tasks: list[asyncio.Task] = []
         self._stats = {
@@ -338,6 +344,11 @@ class InferenceEngine:
             "processed_requests": 0,
             "processed_batches": 0,
             "last_batch_size": 0,
+            "max_batch_size_seen": 0,
+            "total_queue_wait_ms": 0.0,
+            "total_backend_exec_ms": 0.0,
+            "avg_queue_wait_ms": 0.0,
+            "avg_backend_exec_ms": 0.0,
         }
 
     async def start(self) -> None:
@@ -348,11 +359,12 @@ class InferenceEngine:
                 asyncio.create_task(self._worker_loop(i), name=f"engine-worker-{i}")
             )
         LOG.info(
-            "Engine started backend=%s workers=%s batch_max=%s batch_wait_ms=%s",
+            "Engine started backend=%s workers=%s batch_max=%s batch_wait_ms=%s adaptive_wait=%s",
             self._backend_name,
             self._worker_count,
             self._batch_max_size,
             self._batch_wait_ms,
+            self._adaptive_wait,
         )
 
     async def stop(self) -> None:
@@ -371,28 +383,60 @@ class InferenceEngine:
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[EngineResponse] = loop.create_future()
         self._stats["submitted_requests"] += 1
-        await self._queue.put((req, fut))
+        await self._queue.put((req, fut, time.perf_counter()))
         return await fut
+
+    def _next_batch_timeout_s(self) -> float:
+        """Adaptive wait window: lower wait as queue pressure rises."""
+        if self._batch_wait_ms <= 0.0:
+            return 0.0
+        if not self._adaptive_wait:
+            return self._batch_wait_ms / 1000.0
+        q = self._queue.qsize()
+        if q >= self._batch_max_size:
+            return 0.0
+        if q <= 1:
+            return self._batch_wait_ms / 1000.0
+        return (self._batch_wait_ms / 2.0) / 1000.0
 
     async def _worker_loop(self, worker_idx: int) -> None:
         while True:
-            first_req, first_fut = await self._queue.get()
-            batch: list[tuple[EngineRequest, asyncio.Future[EngineResponse]]] = [(first_req, first_fut)]
+            first_req, first_fut, first_enqueued_at = await self._queue.get()
+            batch: list[tuple[EngineRequest, asyncio.Future[EngineResponse], float]] = [
+                (first_req, first_fut, first_enqueued_at)
+            ]
 
             # Drain extra requests for a tiny window to form a micro-batch.
             while len(batch) < self._batch_max_size:
                 try:
+                    timeout_s = self._next_batch_timeout_s()
+                    if timeout_s <= 0.0:
+                        nxt = self._queue.get_nowait()
+                    else:
+                        nxt = await asyncio.wait_for(self._queue.get(), timeout=timeout_s)
+                    batch.append(nxt)
+                except asyncio.QueueEmpty:
+                    break
+                except TimeoutError:
+                    break
+                except asyncio.TimeoutError:
+                    break
+                except Exception:
+                    # Keep worker resilient on edge timeout behavior.
                     nxt = await asyncio.wait_for(
                         self._queue.get(), timeout=self._batch_wait_ms / 1000.0
                     )
                     batch.append(nxt)
-                except TimeoutError:
-                    break
 
-            reqs = [r for r, _ in batch]
-            futs = [f for _, f in batch]
+            reqs = [r for r, _, _ in batch]
+            futs = [f for _, f, _ in batch]
+            enqueue_times = [ts for _, _, ts in batch]
             try:
+                now = time.perf_counter()
+                queue_wait_ms = sum((now - ts) * 1000.0 for ts in enqueue_times)
+                backend_t0 = time.perf_counter()
                 responses = self._run_batch_grouped(reqs)
+                backend_exec_ms = (time.perf_counter() - backend_t0) * 1000.0
                 if len(responses) != len(reqs):
                     raise RuntimeError(
                         f"backend returned {len(responses)} responses for batch of {len(reqs)}"
@@ -403,6 +447,18 @@ class InferenceEngine:
                 self._stats["processed_batches"] += 1
                 self._stats["processed_requests"] += len(batch)
                 self._stats["last_batch_size"] = len(batch)
+                self._stats["max_batch_size_seen"] = max(
+                    int(self._stats["max_batch_size_seen"]), len(batch)
+                )
+                self._stats["total_queue_wait_ms"] += queue_wait_ms
+                self._stats["total_backend_exec_ms"] += backend_exec_ms
+                processed_batches = max(1, int(self._stats["processed_batches"]))
+                self._stats["avg_queue_wait_ms"] = (
+                    float(self._stats["total_queue_wait_ms"]) / processed_batches
+                )
+                self._stats["avg_backend_exec_ms"] = (
+                    float(self._stats["total_backend_exec_ms"]) / processed_batches
+                )
             except Exception as exc:
                 LOG.exception("Worker %s failed processing batch of size %s", worker_idx, len(batch))
                 for fut in futs:
@@ -457,5 +513,6 @@ class InferenceEngine:
             "worker_count": self._worker_count,
             "batch_max_size": self._batch_max_size,
             "batch_wait_ms": self._batch_wait_ms,
+            "adaptive_wait": self._adaptive_wait,
             "queue_size": self._queue.qsize(),
         }
