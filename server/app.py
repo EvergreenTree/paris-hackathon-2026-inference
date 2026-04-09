@@ -8,7 +8,7 @@ from typing import Literal
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from server.engine import EngineRequest, InferenceEngine
+from server.legacy_engine_runtime import EngineRequest, InferenceEngine
 
 MODEL_ID = "Qwen/Qwen3.5-35B-A3B"
 

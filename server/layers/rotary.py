@@ -122,8 +122,18 @@ def set_rope_device(device: torch.device):
     _ROPE_DEVICE = device
 
 
+def _freeze_rope_scaling(value: Any) -> Any:
+    if isinstance(value, dict):
+        return tuple((k, _freeze_rope_scaling(v)) for k, v in sorted(value.items()))
+    if isinstance(value, tuple):
+        return tuple(_freeze_rope_scaling(v) for v in value)
+    if isinstance(value, list):
+        return tuple(_freeze_rope_scaling(v) for v in value)
+    return value
+
+
 @functools.cache
-def get_rope(
+def _get_rope_cached(
     head_dim: int,
     rotary_dim: int,
     max_position: int,
@@ -141,6 +151,17 @@ def get_rope(
         with torch.device(_ROPE_DEVICE):
             return _get_rope(head_dim, rotary_dim, max_position, base, rope_map)
     return _get_rope(head_dim, rotary_dim, max_position, base, rope_map)
+
+
+def get_rope(
+    head_dim: int,
+    rotary_dim: int,
+    max_position: int,
+    base: float,
+    rope_scaling: Tuple[Tuple[str, Any], ...] | None = None,
+) -> RotaryEmbedding:
+    rope_scaling = _freeze_rope_scaling(rope_scaling) if rope_scaling is not None else None
+    return _get_rope_cached(head_dim, rotary_dim, max_position, base, rope_scaling)
 
 
 __all__ = ["get_rope", "RotaryEmbedding", "set_rope_device"]
