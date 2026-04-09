@@ -231,8 +231,15 @@ class HuggingFaceBackend:
         self.torch = torch
         if os.getenv("HACKATHON_TORCH_COMPILE", "0").lower() not in {"0", "false", "no"}:
             try:
-                self.model = torch.compile(self.model, mode="reduce-overhead")
-                LOG.info("torch.compile applied to model on %s", self.device)
+                self.model.forward = torch.compile(
+                    self.model.forward,
+                    fullgraph=False,
+                    dynamic=True,
+                    backend="inductor",
+                    mode="default",
+                    options={"max_autotune": False},
+                )
+                LOG.info("torch.compile(inductor) applied to model.forward on %s", self.device)
             except Exception as exc:
                 LOG.warning("torch.compile failed, continuing without it: %s", exc)
         LOG.info(
@@ -242,6 +249,24 @@ class HuggingFaceBackend:
             self.torch_dtype,
             self.attn_impl,
         )
+        self._warmup()
+
+    def _warmup(self) -> None:
+        """Run dummy forward passes to warm up CUDA and trigger torch.compile JIT."""
+        LOG.info("Warming up model on %s ...", self.device)
+        warmup_sizes = [
+            ([{"role": "user", "content": "Hi"}], 4),
+            ([{"role": "user", "content": "What is 2+2? Answer with just the number."}], 16),
+        ]
+        for msgs, max_tok in warmup_sizes:
+            try:
+                dummy = EngineRequest(messages=msgs, max_tokens=max_tok, temperature=0.0)
+                self.generate(dummy)
+            except Exception as exc:
+                LOG.warning("Warmup pass failed on %s: %s", self.device, exc)
+        if self.torch is not None:
+            self.torch.cuda.synchronize(self._model_device)
+        LOG.info("Warmup complete on %s", self.device)
 
     def _render_prompt(self, messages: list[dict[str, str]]) -> str:
         try:

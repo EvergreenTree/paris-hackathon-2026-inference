@@ -13,9 +13,9 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
-    model: str
+    model: str = MODEL_ID
     messages: list[ChatMessage]
-    max_tokens: int = Field(..., gt=0, le=8192)
+    max_tokens: int = Field(default=1024, gt=0, le=8192)
     temperature: float = 0.0
     top_p: float = 1.0
 

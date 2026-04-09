@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 
 import aiohttp
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import Response
 
 from server.models import (
     MODEL_ID,
@@ -116,8 +117,8 @@ async def metrics() -> dict:
     }
 
 
-@app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
-async def chat_completions(req: ChatCompletionRequest) -> ChatCompletionResponse:
+@app.post("/v1/chat/completions")
+async def chat_completions(req: ChatCompletionRequest):
     if not req.messages:
         raise HTTPException(status_code=400, detail="messages must be non-empty")
 
@@ -135,25 +136,17 @@ async def chat_completions(req: ChatCompletionRequest) -> ChatCompletionResponse
                 f"{base}/v1/chat/completions",
                 json=req.model_dump(),
             ) as resp:
-                body = await resp.text()
+                body = await resp.read()
                 if resp.status != 200:
                     app.state.stats["router_errors"] += 1
                     app.state.stats["failed_per_worker"][idx] += 1
                     if resp.status >= 500 and attempt + 1 < max_attempts:
                         app.state.stats["router_retries"] += 1
                         continue
-                    raise HTTPException(status_code=resp.status, detail=body)
-                payload = ChatCompletionResponse.model_validate_json(body)
+                    raise HTTPException(status_code=resp.status, detail=body.decode())
                 app.state.stats["routed_requests"] += 1
                 app.state.stats["routed_per_worker"][idx] += 1
-                return ChatCompletionResponse(
-                    id=f"chatcmpl-{uuid.uuid4().hex[:24]}",
-                    created=int(time.time()),
-                    model=req.model or MODEL_ID,
-                    object="chat.completion",
-                    choices=payload.choices,
-                    usage=payload.usage,
-                )
+                return Response(content=body, media_type="application/json")
         except HTTPException as exc:
             last_error = exc
             if exc.status_code < 500 or attempt + 1 >= max_attempts:
