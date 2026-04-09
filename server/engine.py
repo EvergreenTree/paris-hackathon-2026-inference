@@ -207,6 +207,7 @@ class HuggingFaceBackend:
             self.model_id,
             torch_dtype=dtype,
             device_map={"": device_map_target},
+            attn_implementation="sdpa",
         )
         self.model.eval()
         self.torch = torch
