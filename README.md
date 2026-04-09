@@ -226,3 +226,36 @@ baseline/
   run_baseline.sh                  # Generate vLLM baseline numbers
   results/                         # Baseline results
 ```
+
+## Team Server Scaffold
+
+This repo now includes a minimal OpenAI-compatible server scaffold in `server/`.
+
+### Run the server locally (fallback backend)
+
+```bash
+uv venv --python 3.12
+uv pip install -e .
+.venv/bin/run-server --host 127.0.0.1 --port 8000
+```
+
+Health endpoint includes active backend:
+
+```bash
+curl http://127.0.0.1:8000/health
+# {"status":"ok","backend":"RuleBasedBackend"}
+```
+
+### Enable real model generation (Hugging Face backend)
+
+Set backend env vars before starting server:
+
+```bash
+export HACKATHON_BACKEND=hf
+export HACKATHON_MODEL_ID=Qwen/Qwen3.5-35B-A3B
+export HACKATHON_DEVICE=cuda
+export HACKATHON_DTYPE=bfloat16
+.venv/bin/run-server --host 0.0.0.0 --port 8000
+```
+
+If runtime dependencies are unavailable, the server falls back to `RuleBasedBackend`.

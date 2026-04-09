@@ -62,7 +62,7 @@ app = FastAPI(title="Hackathon Inference Server", version="0.1.0", lifespan=life
 
 @app.get("/health")
 async def health() -> dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "ok", "backend": app.state.engine.backend_name}
 
 
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)

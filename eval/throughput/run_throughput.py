@@ -251,9 +251,15 @@ async def run_concurrency_level(
         return {
             "concurrency": concurrency,
             "throughput_tok_per_sec": 0,
+            "total_tokens": 0,
+            "total_prompt_tokens": 0,
+            "total_completion_tokens": 0,
+            "reported_prompt_tokens": 0,
+            "reported_completion_tokens": 0,
             "successful_requests": 0,
             "failed_requests": len(failed),
             "wall_time_sec": wall_time,
+            "token_discrepancy": True,
             "spot_checks_passed": 0,
             "spot_checks_total": 0,
         }
