@@ -229,6 +229,12 @@ class HuggingFaceBackend:
         self.model.eval()
         self._model_device = next(self.model.parameters()).device
         self.torch = torch
+        if os.getenv("HACKATHON_TORCH_COMPILE", "0").lower() not in {"0", "false", "no"}:
+            try:
+                self.model = torch.compile(self.model, mode="reduce-overhead")
+                LOG.info("torch.compile applied to model on %s", self.device)
+            except Exception as exc:
+                LOG.warning("torch.compile failed, continuing without it: %s", exc)
         LOG.info(
             "Loaded model backend model_id=%s device=%s dtype=%s attn_impl=%s",
             self.model_id,

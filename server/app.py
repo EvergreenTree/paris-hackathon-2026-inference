@@ -3,48 +3,18 @@ from __future__ import annotations
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Literal
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
 
 from server.engine import EngineOverloadedError, EngineRequest, InferenceEngine
-
-MODEL_ID = "Qwen/Qwen3.5-35B-A3B"
-
-
-class ChatMessage(BaseModel):
-    role: Literal["system", "user", "assistant", "tool"] = "user"
-    content: str
-
-
-class ChatCompletionRequest(BaseModel):
-    model: str
-    messages: list[ChatMessage]
-    max_tokens: int = Field(..., gt=0, le=8192)
-    temperature: float = 0.0
-    top_p: float = 1.0
-
-
-class ChatChoice(BaseModel):
-    index: int
-    message: ChatMessage
-    finish_reason: Literal["stop", "length"]
-
-
-class Usage(BaseModel):
-    prompt_tokens: int
-    completion_tokens: int
-    total_tokens: int
-
-
-class ChatCompletionResponse(BaseModel):
-    id: str
-    object: Literal["chat.completion"] = "chat.completion"
-    created: int
-    model: str
-    choices: list[ChatChoice]
-    usage: Usage
+from server.models import (
+    MODEL_ID,
+    ChatChoice,
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    ChatMessage,
+    Usage,
+)
 
 
 @asynccontextmanager

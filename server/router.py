@@ -5,47 +5,16 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Literal
 
 import aiohttp
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
 
-MODEL_ID = "Qwen/Qwen3.5-35B-A3B"
-
-
-class ChatMessage(BaseModel):
-    role: Literal["system", "user", "assistant", "tool"] = "user"
-    content: str
-
-
-class ChatCompletionRequest(BaseModel):
-    model: str
-    messages: list[ChatMessage]
-    max_tokens: int = Field(..., gt=0, le=8192)
-    temperature: float = 0.0
-    top_p: float = 1.0
-
-
-class ChatChoice(BaseModel):
-    index: int
-    message: ChatMessage
-    finish_reason: Literal["stop", "length"]
-
-
-class Usage(BaseModel):
-    prompt_tokens: int
-    completion_tokens: int
-    total_tokens: int
-
-
-class ChatCompletionResponse(BaseModel):
-    id: str
-    object: Literal["chat.completion"] = "chat.completion"
-    created: int
-    model: str
-    choices: list[ChatChoice]
-    usage: Usage
+from server.models import (
+    MODEL_ID,
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    ChatMessage,
+)
 
 
 def _worker_urls() -> list[str]:
@@ -105,7 +74,6 @@ async def _pick_worker_index(exclude: set[int] | None = None) -> int:
             candidates = [i for i in available if app.state.pending[i] == min_pending]
             idx = candidates[app.state.rr % len(candidates)]
         else:
-            # Strict round-robin across currently available workers.
             idx = available[app.state.rr % len(available)]
         app.state.rr = (app.state.rr + 1) % len(app.state.pending)
         app.state.pending[idx] += 1
@@ -171,7 +139,6 @@ async def chat_completions(req: ChatCompletionRequest) -> ChatCompletionResponse
                 if resp.status != 200:
                     app.state.stats["router_errors"] += 1
                     app.state.stats["failed_per_worker"][idx] += 1
-                    # Retry only transient server-side errors.
                     if resp.status >= 500 and attempt + 1 < max_attempts:
                         app.state.stats["router_retries"] += 1
                         continue
