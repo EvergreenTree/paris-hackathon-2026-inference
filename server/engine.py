@@ -6,9 +6,11 @@ import logging
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import lru_cache
 from collections import defaultdict
+from threading import Lock
 from typing import Literal, Protocol
 
 MODEL_ID = "Qwen/Qwen3.5-35B-A3B"
@@ -173,10 +175,10 @@ class RuleBasedBackend:
 class HuggingFaceBackend:
     """Direct Transformers backend for initial real model execution."""
 
-    def __init__(self) -> None:
+    def __init__(self, device_override: str | None = None) -> None:
         self.model_id = os.getenv("HACKATHON_MODEL_ID", MODEL_ID)
         self.tokenizer_id = os.getenv("HACKATHON_TOKENIZER_ID", self.model_id)
-        self.device = os.getenv("HACKATHON_DEVICE", "cuda")
+        self.device = device_override or os.getenv("HACKATHON_DEVICE", "cuda")
         self.torch_dtype = os.getenv("HACKATHON_DTYPE", "bfloat16")
         self.max_new_tokens_cap = int(os.getenv("HACKATHON_MAX_NEW_TOKENS_CAP", "1024"))
         self.tokenizer = None
@@ -195,10 +197,16 @@ class HuggingFaceBackend:
         self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_id)
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        device_map_target: str | int = self.device
+        if isinstance(self.device, str) and self.device.startswith("cuda:"):
+            try:
+                device_map_target = int(self.device.split(":", 1)[1])
+            except Exception:
+                device_map_target = self.device
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_id,
             torch_dtype=dtype,
-            device_map=self.device,
+            device_map={"": device_map_target},
         )
         self.model.eval()
         self.torch = torch
@@ -222,7 +230,8 @@ class HuggingFaceBackend:
     def generate(self, req: EngineRequest) -> EngineResponse:
         prompt_text = self._render_prompt(req.messages)
         inputs = self.tokenizer(prompt_text, return_tensors="pt")
-        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+        model_device = next(self.model.parameters()).device
+        inputs = {k: v.to(model_device) for k, v in inputs.items()}
 
         prompt_tokens = int(inputs["input_ids"].shape[-1])
         max_new_tokens = max(1, min(req.max_tokens, self.max_new_tokens_cap))
@@ -273,7 +282,8 @@ class HuggingFaceBackend:
 
         prompts = [self._render_prompt(r.messages) for r in reqs]
         inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=False)
-        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+        model_device = next(self.model.parameters()).device
+        inputs = {k: v.to(model_device) for k, v in inputs.items()}
 
         if "attention_mask" in inputs:
             prompt_lens = inputs["attention_mask"].sum(dim=1).tolist()
@@ -314,10 +324,94 @@ class HuggingFaceBackend:
         return responses
 
 
+class DataParallelHuggingFaceBackend:
+    """Replicates HF backend across multiple GPUs for data-parallel serving."""
+
+    def __init__(self) -> None:
+        try:
+            import torch
+        except Exception as exc:
+            raise RuntimeError(f"failed to import torch for data-parallel backend: {exc}") from exc
+
+        available_gpus = torch.cuda.device_count()
+        requested = int(os.getenv("HACKATHON_DATA_PARALLEL_REPLICAS", "0"))
+        if requested <= 0:
+            requested = available_gpus
+
+        if available_gpus <= 0:
+            raise RuntimeError("no CUDA GPUs available for data-parallel backend")
+
+        self.replica_count = max(1, min(requested, available_gpus))
+        self._replicas = [
+            HuggingFaceBackend(device_override=f"cuda:{idx}") for idx in range(self.replica_count)
+        ]
+        self._executor = ThreadPoolExecutor(max_workers=self.replica_count, thread_name_prefix="hf-replica")
+        self._pending = [0 for _ in range(self.replica_count)]
+        self._rr = 0
+        self._lock = Lock()
+        LOG.info("Initialized data-parallel backend with %s replicas", self.replica_count)
+
+    def _choose_replica_index_unlocked(self) -> int:
+        # Caller must hold self._lock.
+        min_pending = min(self._pending)
+        candidates = [i for i, p in enumerate(self._pending) if p == min_pending]
+        chosen = candidates[self._rr % len(candidates)]
+        self._rr = (self._rr + 1) % self.replica_count
+        return chosen
+
+    def generate(self, req: EngineRequest) -> EngineResponse:
+        return self.generate_batch([req])[0]
+
+    def generate_batch(self, reqs: list[EngineRequest]) -> list[EngineResponse]:
+        if not reqs:
+            return []
+        if self.replica_count == 1:
+            return self._replicas[0].generate_batch(reqs)
+
+        # Assign requests to replicas by current load.
+        assignments: dict[int, list[tuple[int, EngineRequest]]] = defaultdict(list)
+        with self._lock:
+            for idx, req in enumerate(reqs):
+                ridx = self._choose_replica_index_unlocked()
+                assignments[ridx].append((idx, req))
+                self._pending[ridx] += 1
+
+        futures = {}
+        for ridx, items in assignments.items():
+            batch_reqs = [req for _, req in items]
+            fut = self._executor.submit(self._replicas[ridx].generate_batch, batch_reqs)
+            futures[fut] = (ridx, items)
+
+        out: list[EngineResponse | None] = [None] * len(reqs)
+        try:
+            for fut, (ridx, items) in futures.items():
+                responses = fut.result()
+                if len(responses) != len(items):
+                    raise RuntimeError(
+                        f"replica {ridx} returned {len(responses)} responses for {len(items)} requests"
+                    )
+                for (orig_idx, _), resp in zip(items, responses, strict=True):
+                    out[orig_idx] = resp
+        finally:
+            with self._lock:
+                for ridx, items in assignments.items():
+                    self._pending[ridx] = max(0, self._pending[ridx] - len(items))
+
+        if any(resp is None for resp in out):
+            raise RuntimeError("internal error: missing response in data-parallel batch execution")
+        return [resp for resp in out if resp is not None]
+
+    def close(self) -> None:
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+
 def build_backend() -> InferenceBackend:
     backend_name = os.getenv("HACKATHON_BACKEND", "rule-based").strip().lower()
     if backend_name in {"hf", "huggingface", "transformers"}:
         try:
+            requested_replicas = int(os.getenv("HACKATHON_DATA_PARALLEL_REPLICAS", "0"))
+            if requested_replicas > 1:
+                return DataParallelHuggingFaceBackend()
             return HuggingFaceBackend()
         except Exception as exc:
             LOG.warning("Falling back to rule-based backend: %s", exc)
@@ -433,6 +527,9 @@ class InferenceEngine:
             except asyncio.CancelledError:
                 pass
         self._worker_tasks = []
+        close_fn = getattr(self._backend, "close", None)
+        if callable(close_fn):
+            close_fn()
 
     def _is_priority(self, req: EngineRequest) -> bool:
         if not self._priority_enabled:
@@ -708,4 +805,5 @@ class InferenceEngine:
             "queue_size": self.total_queue_size(),
             "priority_queue_size": self._priority_queue.qsize(),
             "normal_queue_size": self._normal_queue.qsize(),
+            "data_parallel_replicas": getattr(self._backend, "replica_count", 1),
         }
