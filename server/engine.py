@@ -7,6 +7,7 @@ import os
 import re
 from dataclasses import dataclass
 from functools import lru_cache
+from collections import defaultdict
 from typing import Literal, Protocol
 
 MODEL_ID = "Qwen/Qwen3.5-35B-A3B"
@@ -391,12 +392,12 @@ class InferenceEngine:
             reqs = [r for r, _ in batch]
             futs = [f for _, f in batch]
             try:
-                responses = self._run_batch(reqs)
-                if len(responses) != len(batch):
+                responses = self._run_batch_grouped(reqs)
+                if len(responses) != len(reqs):
                     raise RuntimeError(
-                        f"backend returned {len(responses)} responses for batch of {len(batch)}"
+                        f"backend returned {len(responses)} responses for batch of {len(reqs)}"
                     )
-                for fut, resp in zip(futs, responses):
+                for fut, resp in zip(futs, responses, strict=True):
                     if not fut.done():
                         fut.set_result(resp)
                 self._stats["processed_batches"] += 1
@@ -416,6 +417,29 @@ class InferenceEngine:
         if callable(generate_batch):
             return generate_batch(reqs)
         return [self._backend.generate(r) for r in reqs]
+
+    def _run_batch_grouped(self, reqs: list[EngineRequest]) -> list[EngineResponse]:
+        """Group requests by generation config to maximize real batched execution."""
+        grouped_indices: dict[tuple[int, float, float], list[int]] = defaultdict(list)
+        for idx, req in enumerate(reqs):
+            key = (req.max_tokens, req.temperature, req.top_p)
+            grouped_indices[key].append(idx)
+
+        out: list[EngineResponse | None] = [None] * len(reqs)
+        for indices in grouped_indices.values():
+            group_reqs = [reqs[i] for i in indices]
+            group_responses = self._run_batch(group_reqs)
+            if len(group_responses) != len(group_reqs):
+                raise RuntimeError(
+                    f"backend returned {len(group_responses)} responses for grouped batch of {len(group_reqs)}"
+                )
+            for i, resp in zip(indices, group_responses, strict=True):
+                out[i] = resp
+
+        # By this point, every slot should be filled.
+        if any(resp is None for resp in out):
+            raise RuntimeError("internal error: missing response in grouped batch execution")
+        return [resp for resp in out if resp is not None]
 
     @property
     def backend_name(self) -> str:
