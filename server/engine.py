@@ -278,9 +278,11 @@ class HuggingFaceBackend:
     def _warmup(self) -> None:
         """Run dummy forward passes to warm up CUDA and trigger torch.compile JIT."""
         LOG.info("Warming up model on %s ...", self.device)
+        long_content = "Explain step by step. " * 80
         warmup_sizes = [
             ([{"role": "user", "content": "Hi"}], 4),
             ([{"role": "user", "content": "What is 2+2? Answer with just the number."}], 16),
+            ([{"role": "user", "content": long_content}], 8),
         ]
         for msgs, max_tok in warmup_sizes:
             try:
