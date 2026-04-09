@@ -331,7 +331,19 @@ class InferenceEngine:
     def __init__(self) -> None:
         self._backend: InferenceBackend = build_backend()
         self._backend_name = self._backend.__class__.__name__
-        self._worker_count = max(1, int(os.getenv("HACKATHON_WORKER_COUNT", "1")))
+        self._base_worker_count = max(1, int(os.getenv("HACKATHON_WORKER_COUNT", "1")))
+        self._max_worker_count = max(
+            self._base_worker_count,
+            int(os.getenv("HACKATHON_MAX_WORKER_COUNT", str(self._base_worker_count))),
+        )
+        self._autoscale_workers = os.getenv("HACKATHON_AUTOSCALE_WORKERS", "1").lower() not in {
+            "0",
+            "false",
+            "no",
+        }
+        self._autoscale_check_ms = max(50.0, float(os.getenv("HACKATHON_AUTOSCALE_CHECK_MS", "250.0")))
+        self._autoscale_scale_up_q = max(1, int(os.getenv("HACKATHON_AUTOSCALE_SCALE_UP_Q", "8")))
+        self._autoscale_scale_down_q = max(0, int(os.getenv("HACKATHON_AUTOSCALE_SCALE_DOWN_Q", "2")))
         self._batch_max_size = max(1, int(os.getenv("HACKATHON_BATCH_MAX_SIZE", "8")))
         self._batch_wait_ms = max(0.0, float(os.getenv("HACKATHON_BATCH_WAIT_MS", "2.0")))
         self._max_pending_requests = max(1, int(os.getenv("HACKATHON_MAX_PENDING_REQUESTS", "4096")))
@@ -353,6 +365,7 @@ class InferenceEngine:
             tuple[EngineRequest, asyncio.Future[EngineResponse], float, str]
         ] = asyncio.Queue()
         self._worker_tasks: list[asyncio.Task] = []
+        self._autoscaler_task: asyncio.Task | None = None
         self._stats = {
             "submitted_requests": 0,
             "processed_requests": 0,
@@ -368,25 +381,36 @@ class InferenceEngine:
             "normal_enqueued": 0,
             "priority_processed": 0,
             "normal_processed": 0,
+            "autoscale_scale_up_events": 0,
+            "autoscale_scale_down_events": 0,
         }
 
     async def start(self) -> None:
         if self._worker_tasks:
             return
-        for i in range(self._worker_count):
-            self._worker_tasks.append(
-                asyncio.create_task(self._worker_loop(i), name=f"engine-worker-{i}")
-            )
+        for i in range(self._base_worker_count):
+            await self._spawn_worker(i)
+        if self._autoscale_workers and self._max_worker_count > self._base_worker_count:
+            self._autoscaler_task = asyncio.create_task(self._autoscaler_loop(), name="engine-autoscaler")
         LOG.info(
-            "Engine started backend=%s workers=%s batch_max=%s batch_wait_ms=%s adaptive_wait=%s",
+            "Engine started backend=%s workers=%s/%s autoscale=%s batch_max=%s batch_wait_ms=%s adaptive_wait=%s",
             self._backend_name,
-            self._worker_count,
+            self._base_worker_count,
+            self._max_worker_count,
+            self._autoscale_workers,
             self._batch_max_size,
             self._batch_wait_ms,
             self._adaptive_wait,
         )
 
     async def stop(self) -> None:
+        if self._autoscaler_task is not None:
+            self._autoscaler_task.cancel()
+            try:
+                await self._autoscaler_task
+            except asyncio.CancelledError:
+                pass
+            self._autoscaler_task = None
         if not self._worker_tasks:
             return
         for task in self._worker_tasks:
@@ -437,6 +461,35 @@ class InferenceEngine:
         if q <= 1:
             return self._batch_wait_ms / 1000.0
         return (self._batch_wait_ms / 2.0) / 1000.0
+
+    async def _spawn_worker(self, idx: int) -> None:
+        self._worker_tasks.append(
+            asyncio.create_task(self._worker_loop(idx), name=f"engine-worker-{idx}")
+        )
+
+    async def _autoscaler_loop(self) -> None:
+        next_worker_idx = self._base_worker_count
+        while True:
+            await asyncio.sleep(self._autoscale_check_ms / 1000.0)
+            q = self.total_queue_size()
+            alive = [t for t in self._worker_tasks if not t.done()]
+            self._worker_tasks = alive
+            worker_count = len(alive)
+
+            if q >= self._autoscale_scale_up_q and worker_count < self._max_worker_count:
+                await self._spawn_worker(next_worker_idx)
+                next_worker_idx += 1
+                self._stats["autoscale_scale_up_events"] += 1
+                continue
+
+            if (
+                q <= self._autoscale_scale_down_q
+                and worker_count > self._base_worker_count
+                and self._worker_tasks
+            ):
+                task = self._worker_tasks.pop()
+                task.cancel()
+                self._stats["autoscale_scale_down_events"] += 1
 
     async def _dequeue_once(
         self, timeout_s: float | None = None
@@ -581,7 +634,13 @@ class InferenceEngine:
         return {
             **self._stats,
             "backend": self._backend_name,
-            "worker_count": self._worker_count,
+            "worker_count": len(self._worker_tasks),
+            "base_worker_count": self._base_worker_count,
+            "max_worker_count": self._max_worker_count,
+            "autoscale_workers": self._autoscale_workers,
+            "autoscale_check_ms": self._autoscale_check_ms,
+            "autoscale_scale_up_q": self._autoscale_scale_up_q,
+            "autoscale_scale_down_q": self._autoscale_scale_down_q,
             "batch_max_size": self._batch_max_size,
             "batch_wait_ms": self._batch_wait_ms,
             "adaptive_wait": self._adaptive_wait,
