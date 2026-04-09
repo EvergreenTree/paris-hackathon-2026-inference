@@ -198,10 +198,18 @@ class HuggingFaceBackend:
         except Exception as exc:
             raise RuntimeError(f"failed to import torch/transformers runtime: {exc}") from exc
 
-        # Allow faster fp32 fallback ops on GPU without changing bf16 weights.
         try:
             torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
             torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+
+        try:
+            import torch._dynamo
+            torch._dynamo.config.cache_size_limit = 256
+            torch._dynamo.config.suppress_errors = True
         except Exception:
             pass
 
@@ -209,16 +217,28 @@ class HuggingFaceBackend:
         self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_id)
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.padding_side = "left"
+
         device_map_target: str | int = self.device
         if isinstance(self.device, str) and self.device.startswith("cuda:"):
             try:
                 device_map_target = int(self.device.split(":", 1)[1])
             except Exception:
                 device_map_target = self.device
+
         config = AutoConfig.from_pretrained(self.model_id)
         if hasattr(config, "text_config"):
             config = config.text_config
-        config.attn_implementation = "sdpa"
+
+        attn_impl = os.getenv("HACKATHON_ATTN_IMPL", "auto")
+        if attn_impl == "auto":
+            try:
+                import flash_attn  # noqa: F401
+                attn_impl = "flash_attention_2"
+            except ImportError:
+                attn_impl = "sdpa"
+        config.attn_implementation = attn_impl
+        self.attn_impl = attn_impl
 
         self.model = Qwen3_5MoeForCausalLM.from_pretrained(
             self.model_id,
@@ -229,25 +249,29 @@ class HuggingFaceBackend:
         self.model.eval()
         self._model_device = next(self.model.parameters()).device
         self.torch = torch
+
         if os.getenv("HACKATHON_TORCH_COMPILE", "0").lower() not in {"0", "false", "no"}:
+            compile_mode = os.getenv("HACKATHON_COMPILE_MODE", "max-autotune-no-cudagraphs")
             try:
                 self.model.forward = torch.compile(
                     self.model.forward,
                     fullgraph=False,
                     dynamic=True,
                     backend="inductor",
-                    mode="default",
-                    options={"max_autotune": False},
+                    mode=compile_mode,
                 )
-                LOG.info("torch.compile(inductor) applied to model.forward on %s", self.device)
+                LOG.info("torch.compile(%s) applied to model.forward on %s", compile_mode, self.device)
             except Exception as exc:
                 LOG.warning("torch.compile failed, continuing without it: %s", exc)
+
+        self._use_fast_generate = os.getenv("HACKATHON_FAST_GENERATE", "1").lower() not in {"0", "false", "no"}
         LOG.info(
-            "Loaded model backend model_id=%s device=%s dtype=%s attn_impl=%s",
+            "Loaded model backend model_id=%s device=%s dtype=%s attn_impl=%s fast_generate=%s",
             self.model_id,
             self.device,
             self.torch_dtype,
             self.attn_impl,
+            self._use_fast_generate,
         )
         self._warmup()
 
@@ -283,6 +307,98 @@ class HuggingFaceBackend:
                 add_generation_prompt=True,
             )
 
+    def _top_p_sample(self, logits, temperature: float, top_p: float):
+        """Nucleus (top-p) sampling from logits."""
+        scaled = logits.div(max(temperature, 1e-5))
+        if top_p < 1.0:
+            sorted_logits, sorted_idx = scaled.sort(descending=True, dim=-1)
+            probs = sorted_logits.softmax(dim=-1)
+            cum = probs.cumsum(dim=-1)
+            remove = (cum - probs) >= top_p
+            remove[..., 0] = False
+            sorted_logits[remove] = float("-inf")
+            scaled = self.torch.empty_like(scaled).scatter_(1, sorted_idx, sorted_logits)
+        return scaled.softmax(dim=-1).multinomial(1).squeeze(-1)
+
+    def _fast_generate(
+        self,
+        input_ids,
+        attention_mask,
+        max_new_tokens: int,
+        do_sample: bool,
+        temperature: float,
+        top_p: float,
+    ):
+        """Tight autoregressive loop that bypasses model.generate() overhead."""
+        device = self._model_device
+        batch_size = input_ids.shape[0]
+        eos_id = self.tokenizer.eos_token_id
+
+        finished = self.torch.zeros(batch_size, dtype=self.torch.bool, device=device)
+        generated = self.torch.full(
+            (batch_size, max_new_tokens), eos_id, dtype=self.torch.long, device=device
+        )
+        gen_lengths = self.torch.zeros(batch_size, dtype=self.torch.long, device=device)
+
+        out = self.model(input_ids=input_ids, attention_mask=attention_mask, use_cache=True)
+        cache = out.past_key_values
+        logits = out.logits[:, -1, :]
+
+        for step in range(max_new_tokens):
+            if do_sample:
+                next_ids = self._top_p_sample(logits, temperature, top_p)
+            else:
+                next_ids = logits.argmax(dim=-1)
+
+            next_ids = self.torch.where(finished, eos_id, next_ids)
+            generated[:, step] = next_ids
+            gen_lengths += (~finished).long()
+
+            finished = finished | (next_ids == eos_id)
+            if finished.all():
+                break
+
+            attention_mask = self.torch.cat(
+                [attention_mask, self.torch.ones((batch_size, 1), device=device, dtype=attention_mask.dtype)],
+                dim=1,
+            )
+            out = self.model(
+                input_ids=next_ids.unsqueeze(1),
+                attention_mask=attention_mask,
+                past_key_values=cache,
+                use_cache=True,
+            )
+            cache = out.past_key_values
+            logits = out.logits[:, -1, :]
+
+        return generated, gen_lengths
+
+    def _decode_responses(
+        self,
+        generated,
+        gen_lengths,
+        prompt_lens: list[int],
+        max_new_tokens: int,
+    ) -> list[EngineResponse]:
+        """Convert raw generated tensor to EngineResponse list."""
+        responses: list[EngineResponse] = []
+        batch_size = generated.shape[0]
+        for i in range(batch_size):
+            gl = int(gen_lengths[i].item())
+            gen_ids = generated[i, :gl]
+            content = self.tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+            completion_tokens = len(self.tokenizer.encode(content, add_special_tokens=False))
+            finish_reason: Literal["stop", "length"] = "length" if completion_tokens >= max_new_tokens else "stop"
+            responses.append(
+                EngineResponse(
+                    content=content,
+                    finish_reason=finish_reason,
+                    prompt_tokens=prompt_lens[i],
+                    completion_tokens=completion_tokens,
+                )
+            )
+        return responses
+
     def generate(self, req: EngineRequest) -> EngineResponse:
         prompt_text = self._render_prompt(req.messages)
         inputs = self.tokenizer(prompt_text, return_tensors="pt")
@@ -291,24 +407,33 @@ class HuggingFaceBackend:
         prompt_tokens = int(inputs["input_ids"].shape[-1])
         max_new_tokens = max(1, min(req.max_tokens, self.max_new_tokens_cap))
         do_sample = req.temperature > 0.0
-        gen_kwargs = {
-            "max_new_tokens": max_new_tokens,
-            "do_sample": do_sample,
-            "temperature": max(req.temperature, 1e-5) if do_sample else None,
-            "top_p": req.top_p if do_sample else None,
-            "pad_token_id": self.tokenizer.eos_token_id,
-            "eos_token_id": self.tokenizer.eos_token_id,
-            "use_cache": True,
-        }
-        # Drop None values so generate() gets clean kwargs.
-        gen_kwargs = {k: v for k, v in gen_kwargs.items() if v is not None}
 
         with self.torch.inference_mode():
+            if self._use_fast_generate:
+                generated, gen_lengths = self._fast_generate(
+                    inputs["input_ids"],
+                    inputs.get("attention_mask", self.torch.ones_like(inputs["input_ids"])),
+                    max_new_tokens,
+                    do_sample,
+                    req.temperature,
+                    req.top_p,
+                )
+                return self._decode_responses(generated, gen_lengths, [prompt_tokens], max_new_tokens)[0]
+
+            gen_kwargs = {
+                "max_new_tokens": max_new_tokens,
+                "do_sample": do_sample,
+                "temperature": max(req.temperature, 1e-5) if do_sample else None,
+                "top_p": req.top_p if do_sample else None,
+                "pad_token_id": self.tokenizer.eos_token_id,
+                "eos_token_id": self.tokenizer.eos_token_id,
+                "use_cache": True,
+            }
+            gen_kwargs = {k: v for k, v in gen_kwargs.items() if v is not None}
             output_ids = self.model.generate(**inputs, **gen_kwargs)
 
         generated_ids = output_ids[0, prompt_tokens:]
         content = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
-        # Report completion token count on decoded text to match evaluator verification.
         completion_tokens = len(self.tokenizer.encode(content, add_special_tokens=False))
         finish_reason: Literal["stop", "length"] = "length" if completion_tokens >= max_new_tokens else "stop"
         return EngineResponse(
@@ -324,8 +449,6 @@ class HuggingFaceBackend:
         if len(reqs) == 1:
             return [self.generate(reqs[0])]
 
-        # Keep behavior deterministic/correct by falling back if requests in the
-        # batch have different sampling configs or output limits.
         first = reqs[0]
         same_shape = all(
             r.max_tokens == first.max_tokens
@@ -347,18 +470,29 @@ class HuggingFaceBackend:
 
         max_new_tokens = max(1, min(first.max_tokens, self.max_new_tokens_cap))
         do_sample = first.temperature > 0.0
-        gen_kwargs = {
-            "max_new_tokens": max_new_tokens,
-            "do_sample": do_sample,
-            "temperature": max(first.temperature, 1e-5) if do_sample else None,
-            "top_p": first.top_p if do_sample else None,
-            "pad_token_id": self.tokenizer.pad_token_id,
-            "eos_token_id": self.tokenizer.eos_token_id,
-            "use_cache": True,
-        }
-        gen_kwargs = {k: v for k, v in gen_kwargs.items() if v is not None}
 
         with self.torch.inference_mode():
+            if self._use_fast_generate:
+                generated, gen_lengths = self._fast_generate(
+                    inputs["input_ids"],
+                    inputs.get("attention_mask", self.torch.ones_like(inputs["input_ids"])),
+                    max_new_tokens,
+                    do_sample,
+                    first.temperature,
+                    first.top_p,
+                )
+                return self._decode_responses(generated, gen_lengths, [int(p) for p in prompt_lens], max_new_tokens)
+
+            gen_kwargs = {
+                "max_new_tokens": max_new_tokens,
+                "do_sample": do_sample,
+                "temperature": max(first.temperature, 1e-5) if do_sample else None,
+                "top_p": first.top_p if do_sample else None,
+                "pad_token_id": self.tokenizer.pad_token_id,
+                "eos_token_id": self.tokenizer.eos_token_id,
+                "use_cache": True,
+            }
+            gen_kwargs = {k: v for k, v in gen_kwargs.items() if v is not None}
             output_ids = self.model.generate(**inputs, **gen_kwargs)
 
         responses: list[EngineResponse] = []

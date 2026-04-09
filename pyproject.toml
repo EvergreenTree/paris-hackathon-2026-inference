@@ -15,6 +15,7 @@ dependencies = [
     "tqdm",
     "numpy",
     "flash-linear-attention>=0.4.2",
+    "causal-conv1d>=1.2.0",
 ]
 
 [project.optional-dependencies]
