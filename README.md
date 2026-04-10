@@ -1,8 +1,18 @@
-# Inference Engine Hackathon
+# Inference Engine Hackathon — GPU MODE × PyTorch (Paris 2026)
 
-Build an inference engine from scratch for **Qwen/Qwen3.5-35B-A3B** on **8xH200**.
+This repository is our team’s submission for the **inference optimization track** at [**PyTorch × GPU MODE Hackathon: No gradient descent. Only ascent.**](https://luma.com/gpu-mode-paris-2026) (Paris, 2026). The event paired **distributed training** and **LLM inference** tracks with talks from PyTorch, vLLM, Prime Intellect, and partners.
 
-This repo provides the evaluation harness: a correctness benchmark, a throughput benchmark, and vLLM baseline numbers to compare against.
+**Task (inference track):** Build a high-throughput inference engine for [**Qwen/Qwen3.5-35B-A3B**](https://huggingface.co/Qwen/Qwen3.5-35B-A3B) on **8× NVIDIA H200**, exposing an **OpenAI-compatible** `POST /v1/chat/completions` API—without using high-level serving frameworks such as vLLM or SGLang (per [official rules](https://github.com/gpu-mode/paris-hackathon-2026-inference)).
+
+**What’s in this repo**
+
+| Area | Contents |
+|------|----------|
+| **Evaluation harness** | GSM8K-CoT correctness, weighted throughput benchmark, API conformance checks, scoring helper |
+| **Our engine** | Process-per-GPU workers + router, HuggingFace Transformers + `Qwen3_5MoeForCausalLM`, async micro-batching, `start_server.sh` submission entrypoint |
+| **Baselines** | Reference numbers and scripts to compare against vLLM-style baselines |
+
+> **Note:** Full model serving requires a CUDA machine with enough GPU memory (e.g. hackathon **8× H200**). You can still install the repo and run `eval.check_server` against the **rule-based** fallback on CPU for API smoke tests.
 
 ## Rules
 
@@ -266,7 +276,7 @@ We built a **process-per-GPU data-parallel inference engine** with a load-balanc
 | **torch.compile (inductor)** | Optional | Off by default (`HACKATHON_TORCH_COMPILE=0`). Can help some setups but caused long CPU compile stalls here; enable only after profiling |
 | **Startup warmup** | Reliability | One tiny generation when compile is off (fast startup); extra passes when compile is on to prime JIT |
 | **Flash Attention auto-detect** | Medium | Automatically uses `flash_attention_2` when available, falls back to SDPA |
-| **CUDA tuning flags** | Low | TF32 matmul, cuDNN benchmark mode, dynamo cache limit=256 |
+| **CUDA tuning flags** | Low | TF32 matmul, cuDNN benchmark mode; dynamo config only when `torch.compile` is enabled |
 | **Router passthrough** | Low | Raw JSON forwarding avoids Pydantic validation overhead in the router hot path |
 | **Left-pad tokenization** | Correctness | `padding_side="left"` ensures correct batch generation with varying prompt lengths |
 | **Chat template** | Correctness | `enable_thinking=False` disables thinking mode as required by hackathon rules |
@@ -277,7 +287,7 @@ We built a **process-per-GPU data-parallel inference engine** with a load-balanc
 server/
   app.py                  # Per-GPU worker: FastAPI server + InferenceEngine
   router.py               # Load-balancing router across 8 workers
-  engine.py               # Async scheduler, HuggingFace backend, custom generation loop
+  engine.py               # Async scheduler, HuggingFace backend (model.generate)
   models.py               # Shared Pydantic models (OpenAI-compatible request/response)
   modeling_qwen3_5_moe.py # Qwen3.5 MoE model definition (from transformers)
   __init__.py
@@ -313,8 +323,8 @@ All parameters are configurable via environment variables with sensible defaults
 |---|---|---|
 | `HACKATHON_BACKEND` | `hf` | Backend type (`hf` for HuggingFace, `rule-based` for scaffold) |
 | `HACKATHON_DATA_PARALLEL_REPLICAS` | `8` | Number of GPU replicas |
-| `HACKATHON_BATCH_MAX_SIZE` | `8` | Max requests per micro-batch |
-| `HACKATHON_BATCH_WAIT_MS` | `5.0` | Batch accumulation window (ms) |
+| `HACKATHON_BATCH_MAX_SIZE` | `16` | Max requests per micro-batch |
+| `HACKATHON_BATCH_WAIT_MS` | `1.0` | Batch accumulation window (ms) |
 | `HACKATHON_TORCH_COMPILE` | `0` | Set to `1` to enable torch.compile on model.forward (experimental) |
 | `HACKATHON_ROUTER_POLICY` | `least_pending` | Router load-balancing policy |
 | `HACKATHON_ATTN_IMPL` | `auto` | Attention implementation (auto/flash_attention_2/sdpa) |
@@ -334,3 +344,9 @@ python -m eval.throughput.run_throughput --base-url http://localhost:8000
 # Compute final score
 python -m eval.score --correctness results/correctness.json --throughput results/throughput.json
 ```
+
+## Acknowledgments
+
+- [**GPU MODE × PyTorch — Paris 2026**](https://luma.com/gpu-mode-paris-2026) — organizers, sponsors (Verda, Sesterce, PyTorch, Prime Intellect, SemiAnalysis, and others), and the inference-track volunteers.
+- [**paris-hackathon-2026-inference**](https://github.com/gpu-mode/paris-hackathon-2026-inference) — problem statement, harness, and success criteria we built against.
+- [**Qwen Team**](https://huggingface.co/Qwen) for **Qwen3.5-35B-A3B** and the Transformers integration path we rely on.
