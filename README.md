@@ -12,6 +12,8 @@ This repository is our team’s submission for the **inference optimization trac
 | **Our engine** | Process-per-GPU workers + router, HuggingFace Transformers + `Qwen3_5MoeForCausalLM`, async micro-batching, `start_server.sh` submission entrypoint |
 | **Baselines** | Reference numbers and scripts to compare against vLLM-style baselines |
 
+**Outcome (inference track):** Our team placed **3rd** at the hackathon. Our best measured throughput on the official harness was **857 tok/s** (verified prompt + completion tokens per second under the benchmark workload).
+
 > **Note:** Full model serving requires a CUDA machine with enough GPU memory (e.g. hackathon **8× H200**). You can still install the repo and run `eval.check_server` against the **rule-based** fallback on CPU for API smoke tests.
 
 ## Rules
