@@ -1,41 +1,53 @@
 # Inference Engine Hackathon — GPU MODE × PyTorch (Paris 2026)
 
-This repository is our team’s submission for the **inference optimization track** at [**PyTorch × GPU MODE Hackathon: No gradient descent. Only ascent.**](https://luma.com/gpu-mode-paris-2026) (Paris, 2026). The event paired **distributed training** and **LLM inference** tracks with talks from PyTorch, vLLM, Prime Intellect, and partners.
+This repository is our team’s submission for the inference optimization track at [PyTorch × GPU MODE Hackathon: No gradient descent. Only ascent.](https://luma.com/gpu-mode-paris-2026) (Paris, 2026). The event paired distributed training and LLM inference tracks with talks from PyTorch, vLLM, Prime Intellect, and partners.
 
-**Task (inference track):** Build a high-throughput inference engine for [**Qwen/Qwen3.5-35B-A3B**](https://huggingface.co/Qwen/Qwen3.5-35B-A3B) on **8× NVIDIA H200**, exposing an **OpenAI-compatible** `POST /v1/chat/completions` API—without using high-level serving frameworks such as vLLM or SGLang (per [official rules](https://github.com/gpu-mode/paris-hackathon-2026-inference)).
+Task (inference track): Build a high-throughput inference engine for [Qwen/Qwen3.5-35B-A3B](https://huggingface.co/Qwen/Qwen3.5-35B-A3B) on 8× NVIDIA H200, exposing an OpenAI-compatible `POST /v1/chat/completions` API—without using high-level serving frameworks such as vLLM or SGLang (per [official rules](https://github.com/gpu-mode/paris-hackathon-2026-inference)).
 
-**What’s in this repo**
+What’s in this repo
 
 | Area | Contents |
 |------|----------|
-| **Evaluation harness** | GSM8K-CoT correctness, weighted throughput benchmark, API conformance checks, scoring helper |
-| **Our engine** | Process-per-GPU workers + router, HuggingFace Transformers + `Qwen3_5MoeForCausalLM`, async micro-batching, `start_server.sh` submission entrypoint |
-| **Baselines** | Reference numbers and scripts to compare against vLLM-style baselines |
+| Evaluation harness | GSM8K-CoT correctness, weighted throughput benchmark, API conformance checks, scoring helper |
+| Our engine | Process-per-GPU workers + router, HuggingFace Transformers + `Qwen3_5MoeForCausalLM`, async micro-batching, `start_server.sh` submission entrypoint |
+| Baselines | Reference numbers and scripts to compare against vLLM-style baselines |
 
-**Outcome (inference track):** Our team placed **3rd** at the hackathon. Our best measured throughput on the official harness was **857 tok/s** (verified prompt + completion tokens per second under the benchmark workload).
+Outcome (inference track): Our team placed 3rd on the inference track. The table below is a representative run of the official throughput harness (`eval.throughput.run_throughput`): 1024 input tokens and 1024 output tokens per request, 64 requests per concurrency level, model `Qwen/Qwen3.5-35B-A3B`, on 8× NVIDIA H200 with a process router and eight single-GPU workers. Values are verified prompt + completion tok/s as printed by the harness; every level completed 64/64 requests with 2/2 spot checks passing.
 
-> **Note:** Full model serving requires a CUDA machine with enough GPU memory (e.g. hackathon **8× H200**). You can still install the repo and run `eval.check_server` against the **rule-based** fallback on CPU for API smoke tests.
+| Concurrency | tok/s (total) | Requests | Wall time (s) | Spot checks |
+|---|---|---|---|---|
+| 64 | 859.81 | 64/64 | 99.18 | 2/2 |
+| 32 | 731.82 | 64/64 | 113.86 | 2/2 |
+| 16 | 492.64 | 64/64 | 172.91 | 2/2 |
+| 8 | 460.68 | 64/64 | 186.01 | 2/2 |
+| 4 | 276.95 | 64/64 | 311.82 | 2/2 |
+| 2 | 132.09 | 64/64 | 669.09 | 2/2 |
+| 1 | 74.51 | 64/64 | 1143.84 | 2/2 |
+
+Peak verified throughput in this run was 859.81 tok/s at concurrency 64.
+
+> Note: Full model serving requires a CUDA machine with enough GPU memory (e.g. hackathon 8× H200). You can still install the repo and run `eval.check_server` against the rule-based fallback on CPU for API smoke tests.
 
 ## Rules
 
 ### Objective
 
-Implement a high-throughput inference engine for Qwen3.5-35B-A3B that serves an OpenAI-compatible chat completions API. You are scored on **throughput** (output tokens/sec), with **correctness as a hard requirement**.
+Implement a high-throughput inference engine for Qwen3.5-35B-A3B that serves an OpenAI-compatible chat completions API. You are scored on throughput (output tokens/sec), with correctness as a hard requirement.
 
 ### Submission
 
 Your submission consists of:
 
-1. **A start script** — a single script that launches your server and makes it ready on a given port. Must exit cleanly and leave the server running.
-2. **Source code** — your full inference engine implementation.
-3. **Documentation** — a brief writeup explaining your approach, architecture decisions, and any optimizations used.
-4. **Results** — a JSON file containing the throughput results for your engine (we will verify the results ourselves, however to save us time, we would appreciate if you included the results in your submission to do preliminary scoring)
+1. A start script — a single script that launches your server and makes it ready on a given port. Must exit cleanly and leave the server running.
+2. Source code — your full inference engine implementation.
+3. Documentation — a brief writeup explaining your approach, architecture decisions, and any optimizations used.
+4. Results — a JSON file containing the throughput results for your engine (we will verify the results ourselves, however to save us time, we would appreciate if you included the results in your submission to do preliminary scoring)
 
 ### Scoring
 
-**Correctness is a gate.** Your engine must pass the GSM8K-CoT correctness evaluation (exact match >= 87.5%) to be eligible for throughput scoring. Submissions that fail correctness receive a score of 0.
+Correctness is a gate. Your engine must pass the GSM8K-CoT correctness evaluation (exact match >= 87.5%) to be eligible for throughput scoring. Submissions that fail correctness receive a score of 0.
 
-**Throughput determines rank.** We measure verified output tokens/sec at concurrency levels 1, 2, 4, 8, 16, 32, 64. Higher concurrency levels carry higher weight in the final score:
+Throughput determines rank. We measure verified output tokens/sec at concurrency levels 1, 2, 4, 8, 16, 32, 64. Higher concurrency levels carry higher weight in the final score:
 
 | Concurrency | Weight |
 |---|---|
@@ -47,13 +59,13 @@ Your submission consists of:
 | 32 | 4x |
 | 64 | 8x |
 
-**Final score** = weighted sum of verified tok/s across all concurrency levels (if correctness gate is passed).
+Final score = weighted sum of verified tok/s across all concurrency levels (if correctness gate is passed).
 
 ### What's Allowed
 
-- **Precision:** BF16 only. No FP8, INT8, INT4, or any other reduced precision.
-- **Parallelism:** Any parallelism strategy is allowed — tensor parallel, pipeline parallel, expert parallel, data parallel, or any combination.
-- **Inference optimizations:** Allowed, as long as they do not affect correctness or output accuracy. Examples of what's allowed:
+- Precision: BF16 only. No FP8, INT8, INT4, or any other reduced precision.
+- Parallelism: Any parallelism strategy is allowed — tensor parallel, pipeline parallel, expert parallel, data parallel, or any combination.
+- Inference optimizations: Allowed, as long as they do not affect correctness or output accuracy. Examples of what's allowed:
   - FlashAttention or other fused attention kernels
   - Continuous batching / dynamic batching
   - KV cache optimizations (paged attention, etc.)
@@ -62,13 +74,13 @@ Your submission consists of:
   - Custom CUDA/Triton kernels
   - Speculative decoding (if output matches non-speculative)
   - Operator fusion
-- **Not allowed:** Any optimization that changes model outputs compared to a BF16 reference implementation (e.g., quantization, pruning, distillation, approximate attention that drops tokens). **If you're unsure whether an optimization is allowed, ask the organizers.**
-- **Language:** Any language. Python, C++, Rust, CUDA — whatever you want.
-- **Libraries:** You may use low-level libraries (cuBLAS, cuDNN, NCCL, Triton, etc.) but not high-level inference frameworks (vLLM, SGLang, TensorRT-LLM, etc.). The point is to build the engine yourself.
+- Not allowed: Any optimization that changes model outputs compared to a BF16 reference implementation (e.g., quantization, pruning, distillation, approximate attention that drops tokens). If you're unsure whether an optimization is allowed, ask the organizers.
+- Language: Any language. Python, C++, Rust, CUDA — whatever you want.
+- Libraries: You may use low-level libraries (cuBLAS, cuDNN, NCCL, Triton, etc.) but not high-level inference frameworks (vLLM, SGLang, TensorRT-LLM, etc.). The point is to build the engine yourself.
 
 ### Hardware
 
-- **8x NVIDIA H200** (141 GB HBM3e each, NVLink interconnect)
+- 8x NVIDIA H200 (141 GB HBM3e each, NVLink interconnect)
 - No other hardware is available. Your engine must run entirely on this node.
 
 ## Model
@@ -85,7 +97,7 @@ Your submission consists of:
 | Hardware | 8x NVIDIA H200 (141GB each) |
 | Parallelism | Tensor Parallel = 8 (you are free to use any other deployment you want) |
 
-**Important:** Thinking mode must be disabled. Your server must not emit `<think>` tags in output.
+Important: Thinking mode must be disabled. Your server must not emit `<think>` tags in output.
 
 ## API Specification
 
@@ -99,7 +111,7 @@ Returns HTTP 200 when the server is ready.
 
 OpenAI-compatible chat completions (non-streaming only).
 
-**Request:**
+Request:
 
 ```json
 {
@@ -122,7 +134,7 @@ OpenAI-compatible chat completions (non-streaming only).
 | `temperature` | No | 0.0 | Sampling temperature |
 | `top_p` | No | 1.0 | Nucleus sampling parameter |
 
-**Response:**
+Response:
 
 ```json
 {
@@ -148,7 +160,7 @@ OpenAI-compatible chat completions (non-streaming only).
 }
 ```
 
-**Requirements:**
+Requirements:
 - Must handle at least 64 concurrent requests
 - `usage` field with token counts is mandatory
 - `finish_reason` must be `"stop"` (max_tokens reached) or `"length"`
@@ -183,22 +195,22 @@ python -m eval.throughput.run_throughput --base-url http://localhost:8000
 
 ### Correctness: GSM8K-CoT
 
-- **What:** 200 grade-school math problems requiring chain-of-thought reasoning
-- **Why:** Math is extremely sensitive to implementation bugs — wrong attention masks, bad KV cache, quantization errors, or sampling bugs will cause accuracy to collapse
-- **How:** Uses [lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness) with `local-chat-completions` backend
-- **Metric:** Exact match accuracy on the final numeric answer
-- **Gate:** >= 87.5% exact match required to qualify for throughput scoring
-- **Settings:** temperature=0, top_p=1.0, 8 concurrent requests
-- **Seed:** Randomized at eval time
+- What: 200 grade-school math problems requiring chain-of-thought reasoning
+- Why: Math is extremely sensitive to implementation bugs — wrong attention masks, bad KV cache, quantization errors, or sampling bugs will cause accuracy to collapse
+- How: Uses [lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness) with `local-chat-completions` backend
+- Metric: Exact match accuracy on the final numeric answer
+- Gate: >= 87.5% exact match required to qualify for throughput scoring
+- Settings: temperature=0, top_p=1.0, 8 concurrent requests
+- Seed: Randomized at eval time
 
 ### Throughput
 
-- **What:** Verified output tokens/sec at concurrency levels 1, 2, 4, 8, 16, 32, 64
-- **Workload:** 1024 input tokens, 1024 output tokens per request, 64 requests per concurrency level
-- **Warmup:** 2 requests discarded before measurement at each level
-- **Prompts:** Generated at runtime using random token IDs from the full vocabulary (excluding special tokens), matching vLLM's `RandomDataset` approach with iterative decode-encode length adjustment. No pre-computed prompts — all generated fresh each run.
-- **Token verification:** Output tokens are re-counted using the Qwen tokenizer — server-reported `usage.completion_tokens` is compared and discrepancies are flagged. Verified counts are used for scoring.
-- **Spot checks:** 2 math questions per concurrency level are injected among random prompts to verify the server is producing correct outputs, not garbage
+- What: Verified output tokens/sec at concurrency levels 1, 2, 4, 8, 16, 32, 64
+- Workload: 1024 input tokens, 1024 output tokens per request, 64 requests per concurrency level
+- Warmup: 2 requests discarded before measurement at each level
+- Prompts: Generated at runtime using random token IDs from the full vocabulary (excluding special tokens), matching vLLM's `RandomDataset` approach with iterative decode-encode length adjustment. No pre-computed prompts — all generated fresh each run.
+- Token verification: Output tokens are re-counted using the Qwen tokenizer — server-reported `usage.completion_tokens` is compared and discrepancies are flagged. Verified counts are used for scoring.
+- Spot checks: 2 math questions per concurrency level are injected among random prompts to verify the server is producing correct outputs, not garbage
 
 ## Baseline Numbers
 
@@ -208,8 +220,8 @@ Generated using vLLM v0.19.0 on 8xH200 with TP=8, BF16 weights.
 
 | Metric | Score |
 |---|---|
-| Exact match (flexible extract) | **91.5%** |
-| Exact match (strict match) | **91.0%** |
+| Exact match (flexible extract) | 91.5% |
+| Exact match (strict match) | 91.0% |
 
 ### Throughput (1024 input / 1024 output tokens, 64 requests per level)
 
@@ -243,7 +255,7 @@ baseline/
 
 ### Architecture Overview
 
-We built a **process-per-GPU data-parallel inference engine** with a load-balancing router. The design prioritizes high-concurrency throughput (c=32/64 carry the most scoring weight) while maintaining correctness for the GSM8K-CoT gate.
+We built a process-per-GPU data-parallel inference engine with a load-balancing router. The design prioritizes high-concurrency throughput (c=32/64 carry the most scoring weight) while maintaining correctness for the GSM8K-CoT gate.
 
 ```
                     ┌──────────────────────┐
@@ -260,28 +272,28 @@ We built a **process-per-GPU data-parallel inference engine** with a load-balanc
    └─────────────┘    └─────────────┘     └─────────────┘
 ```
 
-**Key design decisions:**
+Key design decisions:
 
-1. **Process-per-GPU isolation** — Each H200 GPU runs a dedicated worker process with its own model replica. No GIL contention, no shared memory, no cross-GPU synchronization. Each worker is a complete FastAPI server with its own async request scheduler.
+1. Process-per-GPU isolation — Each H200 GPU runs a dedicated worker process with its own model replica. No GIL contention, no shared memory, no cross-GPU synchronization. Each worker is a complete FastAPI server with its own async request scheduler.
 
-2. **Least-pending router** — A lightweight FastAPI router on port 8000 distributes requests across workers using a least-pending policy with round-robin tiebreaking. The router passes through raw JSON responses to minimize overhead (no deserialization/reserialization).
+2. Least-pending router — A lightweight FastAPI router on port 8000 distributes requests across workers using a least-pending policy with round-robin tiebreaking. The router passes through raw JSON responses to minimize overhead (no deserialization/reserialization).
 
-3. **Transformers `model.generate()`** — We use HuggingFace's built-in generation path end-to-end. A custom decode loop was tried but regressed throughput badly on this hybrid DeltaNet + MoE stack because `generate()` integrates cache, masks, and model-specific behavior correctly.
+3. Transformers `model.generate()` — We use HuggingFace's built-in generation path end-to-end. A custom decode loop was tried but regressed throughput badly on this hybrid DeltaNet + MoE stack because `generate()` integrates cache, masks, and model-specific behavior correctly.
 
-4. **Async micro-batch scheduler** — Each worker runs an async engine with configurable batch accumulation. Incoming requests are queued with an adaptive wait window (larger batches at high concurrency, no wait at c=1). Priority lanes ensure low-latency interactive requests aren't blocked by bulk workloads.
+4. Async micro-batch scheduler — Each worker runs an async engine with configurable batch accumulation. Incoming requests are queued with an adaptive wait window (larger batches at high concurrency, no wait at c=1). Priority lanes ensure low-latency interactive requests aren't blocked by bulk workloads.
 
 ### Optimizations
 
 | Optimization | Impact | Description |
 |---|---|---|
-| **DeltaNet fast path** | High | `causal-conv1d` + `flash-linear-attention` enable optimized CUDA kernels for the hybrid DeltaNet layers (vs. slow PyTorch fallback) |
-| **torch.compile (inductor)** | Optional | Off by default (`HACKATHON_TORCH_COMPILE=0`). Can help some setups but caused long CPU compile stalls here; enable only after profiling |
-| **Startup warmup** | Reliability | One tiny generation when compile is off (fast startup); extra passes when compile is on to prime JIT |
-| **Flash Attention auto-detect** | Medium | Automatically uses `flash_attention_2` when available, falls back to SDPA |
-| **CUDA tuning flags** | Low | TF32 matmul, cuDNN benchmark mode; dynamo config only when `torch.compile` is enabled |
-| **Router passthrough** | Low | Raw JSON forwarding avoids Pydantic validation overhead in the router hot path |
-| **Left-pad tokenization** | Correctness | `padding_side="left"` ensures correct batch generation with varying prompt lengths |
-| **Chat template** | Correctness | `enable_thinking=False` disables thinking mode as required by hackathon rules |
+| DeltaNet fast path | High | `causal-conv1d` + `flash-linear-attention` enable optimized CUDA kernels for the hybrid DeltaNet layers (vs. slow PyTorch fallback) |
+| torch.compile (inductor) | Optional | Off by default (`HACKATHON_TORCH_COMPILE=0`). Can help some setups but caused long CPU compile stalls here; enable only after profiling |
+| Startup warmup | Reliability | One tiny generation when compile is off (fast startup); extra passes when compile is on to prime JIT |
+| Flash Attention auto-detect | Medium | Automatically uses `flash_attention_2` when available, falls back to SDPA |
+| CUDA tuning flags | Low | TF32 matmul, cuDNN benchmark mode; dynamo config only when `torch.compile` is enabled |
+| Router passthrough | Low | Raw JSON forwarding avoids Pydantic validation overhead in the router hot path |
+| Left-pad tokenization | Correctness | `padding_side="left"` ensures correct batch generation with varying prompt lengths |
+| Chat template | Correctness | `enable_thinking=False` disables thinking mode as required by hackathon rules |
 
 ### File Structure
 
@@ -349,6 +361,6 @@ python -m eval.score --correctness results/correctness.json --throughput results
 
 ## Acknowledgments
 
-- [**GPU MODE × PyTorch — Paris 2026**](https://luma.com/gpu-mode-paris-2026) — organizers, sponsors (Verda, Sesterce, PyTorch, Prime Intellect, SemiAnalysis, and others), and the inference-track volunteers.
-- [**paris-hackathon-2026-inference**](https://github.com/gpu-mode/paris-hackathon-2026-inference) — problem statement, harness, and success criteria we built against.
-- [**Qwen Team**](https://huggingface.co/Qwen) for **Qwen3.5-35B-A3B** and the Transformers integration path we rely on.
+- [GPU MODE × PyTorch — Paris 2026](https://luma.com/gpu-mode-paris-2026) — organizers, sponsors (Verda, Sesterce, PyTorch, Prime Intellect, SemiAnalysis, and others), and the inference-track volunteers.
+- [paris-hackathon-2026-inference](https://github.com/gpu-mode/paris-hackathon-2026-inference) — problem statement, harness, and success criteria we built against.
+- [Qwen Team](https://huggingface.co/Qwen) for Qwen3.5-35B-A3B and the Transformers integration path we rely on.
