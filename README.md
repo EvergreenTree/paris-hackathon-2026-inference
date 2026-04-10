@@ -254,7 +254,7 @@ We built a **process-per-GPU data-parallel inference engine** with a load-balanc
 
 2. **Least-pending router** — A lightweight FastAPI router on port 8000 distributes requests across workers using a least-pending policy with round-robin tiebreaking. The router passes through raw JSON responses to minimize overhead (no deserialization/reserialization).
 
-3. **Custom generation loop** — We bypass HuggingFace's `model.generate()` with a tight autoregressive loop (`_fast_generate`) that calls `model.forward()` directly. This eliminates per-step overhead from stopping criteria chains, logits processors, and beam search scaffolding. Falls back to `model.generate()` automatically if any error occurs.
+3. **Transformers `model.generate()`** — We use HuggingFace's built-in generation path end-to-end. A custom decode loop was tried but regressed throughput badly on this hybrid DeltaNet + MoE stack because `generate()` integrates cache, masks, and model-specific behavior correctly.
 
 4. **Async micro-batch scheduler** — Each worker runs an async engine with configurable batch accumulation. Incoming requests are queued with an adaptive wait window (larger batches at high concurrency, no wait at c=1). Priority lanes ensure low-latency interactive requests aren't blocked by bulk workloads.
 
@@ -263,9 +263,8 @@ We built a **process-per-GPU data-parallel inference engine** with a load-balanc
 | Optimization | Impact | Description |
 |---|---|---|
 | **DeltaNet fast path** | High | `causal-conv1d` + `flash-linear-attention` enable optimized CUDA kernels for the hybrid DeltaNet layers (vs. slow PyTorch fallback) |
-| **torch.compile (inductor)** | Medium | Applied to `model.forward` with `dynamic=True` for JIT-compiled CUDA kernels |
-| **Custom generation loop** | Medium | Removes HF generate() overhead (~10-20% fewer Python ops per decode step) |
-| **Startup warmup** | Reliability | 2 dummy forward passes on each GPU at startup to trigger torch.compile JIT before real requests arrive |
+| **torch.compile (inductor)** | Optional | Off by default (`HACKATHON_TORCH_COMPILE=0`). Can help some setups but caused long CPU compile stalls here; enable only after profiling |
+| **Startup warmup** | Reliability | One tiny generation when compile is off (fast startup); extra passes when compile is on to prime JIT |
 | **Flash Attention auto-detect** | Medium | Automatically uses `flash_attention_2` when available, falls back to SDPA |
 | **CUDA tuning flags** | Low | TF32 matmul, cuDNN benchmark mode, dynamo cache limit=256 |
 | **Router passthrough** | Low | Raw JSON forwarding avoids Pydantic validation overhead in the router hot path |
@@ -316,8 +315,7 @@ All parameters are configurable via environment variables with sensible defaults
 | `HACKATHON_DATA_PARALLEL_REPLICAS` | `8` | Number of GPU replicas |
 | `HACKATHON_BATCH_MAX_SIZE` | `8` | Max requests per micro-batch |
 | `HACKATHON_BATCH_WAIT_MS` | `5.0` | Batch accumulation window (ms) |
-| `HACKATHON_TORCH_COMPILE` | `1` | Enable torch.compile on model.forward |
-| `HACKATHON_FAST_GENERATE` | `1` | Use custom generation loop (vs model.generate) |
+| `HACKATHON_TORCH_COMPILE` | `0` | Set to `1` to enable torch.compile on model.forward (experimental) |
 | `HACKATHON_ROUTER_POLICY` | `least_pending` | Router load-balancing policy |
 | `HACKATHON_ATTN_IMPL` | `auto` | Attention implementation (auto/flash_attention_2/sdpa) |
 
