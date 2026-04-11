@@ -14,6 +14,15 @@ HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+MODEL="${MODEL:-Qwen/Qwen3.5-35B-A3B}"
+TP_SIZE="${TP_SIZE:-8}"
+MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-64}"
+MAX_SEQ_LEN="${MAX_SEQ_LEN:-4096}"
+MAX_PREFILL_LENGTH="${MAX_PREFILL_LENGTH:-8192}"
+CUDA_GRAPH_MAX_BS="${CUDA_GRAPH_MAX_BS:-64}"
+ATTENTION_BACKEND="${ATTENTION_BACKEND:-auto}"
+MOE_BACKEND="${MOE_BACKEND:-auto}"
+MEMORY_RATIO="${MEMORY_RATIO:-0.90}"
 
 mkdir -p "${LOG_DIR}" "${RUN_DIR}"
 
@@ -45,13 +54,22 @@ PY
 ensure_runtime() {
   uv pip install --python "${VENV_DIR}/bin/python" -e "${ROOT_DIR}"
 
-  if ! has_imports fastapi uvicorn transformers torch; then
+  if ! has_imports fastapi uvicorn transformers torch safetensors zmq msgpack flashinfer triton sgl_kernel; then
     uv pip install --python "${VENV_DIR}/bin/python" \
       --extra-index-url https://download.pytorch.org/whl/cu128 \
       "fastapi>=0.115" \
       "uvicorn>=0.30" \
       "transformers>=4.45" \
-      "torch>=2.10.0"
+      "torch>=2.10.0" \
+      "safetensors>=0.5" \
+      "pyzmq>=26" \
+      "msgpack>=1.1" \
+      "flashinfer-python" \
+      "flashinfer-cubin" \
+      "triton>=3.0" \
+      "sgl-kernel" \
+      "psutil" \
+      "prompt-toolkit"
   fi
 }
 
@@ -75,9 +93,20 @@ cleanup_stale_pid
 nohup env \
   CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" \
   LOG_LEVEL="${LOG_LEVEL}" \
-  "${VENV_DIR}/bin/python" "${ROOT_DIR}/prototype/min_server.py" \
+  "${VENV_DIR}/bin/python" -m server \
+  --model "${MODEL}" \
+  --tp-size "${TP_SIZE}" \
+  --dtype bfloat16 \
   --host "${HOST}" \
   --port "${PORT}" \
+  --max-running-requests "${MAX_RUNNING_REQUESTS}" \
+  --max-seq-len-override "${MAX_SEQ_LEN}" \
+  --max-prefill-length "${MAX_PREFILL_LENGTH}" \
+  --cuda-graph-max-bs "${CUDA_GRAPH_MAX_BS}" \
+  --attention-backend "${ATTENTION_BACKEND}" \
+  --moe-backend "${MOE_BACKEND}" \
+  --memory-ratio "${MEMORY_RATIO}" \
+  --cache-type naive \
   > "${LOG_FILE}" 2>&1 &
 
 server_pid=$!

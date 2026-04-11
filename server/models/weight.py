@@ -31,13 +31,102 @@ _SLOT_NAMES = {
 _EXPERT_PATTERN = re.compile(r"^(?P<prefix>.+\.experts)\.(?P<idx>\d+)\.(?P<name>.+)$")
 
 
-def _shard_tensor(key: str, value: torch.Tensor, r: int, n: int, num_kv_heads: int):
+def _slice_heads(
+    value: torch.Tensor,
+    *,
+    num_heads: int,
+    head_dim: int,
+    rank: int,
+    world_size: int,
+    dim: int = 0,
+    allow_replicate: bool = False,
+) -> torch.Tensor:
+    if allow_replicate and num_heads < world_size:
+        head_idx = rank * num_heads // world_size
+        start = head_idx * head_dim
+        return value.narrow(dim, start, head_dim).clone()
+    return value.chunk(world_size, dim=dim)[rank].clone()
+
+
+def _shard_qwen35_linear_attn_tensor(key: str, value: torch.Tensor, r: int, n: int, config):
+    if ".linear_attn." not in key:
+        return None
+
+    key_heads = config.linear_num_key_heads
+    value_heads = config.linear_num_value_heads
+    key_dim = config.linear_key_head_dim
+    value_dim = config.linear_value_head_dim
+    total_key_dim = key_heads * key_dim
+    total_value_dim = value_heads * value_dim
+
+    if key.endswith(".in_proj_qkv.weight") or key.endswith(".conv1d.weight"):
+        q, k, v = value.split([total_key_dim, total_key_dim, total_value_dim], dim=0)
+        return torch.cat(
+            [
+                _slice_heads(
+                    q,
+                    num_heads=key_heads,
+                    head_dim=key_dim,
+                    rank=r,
+                    world_size=n,
+                    allow_replicate=True,
+                ),
+                _slice_heads(
+                    k,
+                    num_heads=key_heads,
+                    head_dim=key_dim,
+                    rank=r,
+                    world_size=n,
+                    allow_replicate=True,
+                ),
+                _slice_heads(
+                    v,
+                    num_heads=value_heads,
+                    head_dim=value_dim,
+                    rank=r,
+                    world_size=n,
+                ),
+            ],
+            dim=0,
+        )
+
+    if key.endswith(".in_proj_z.weight"):
+        return _slice_heads(
+            value,
+            num_heads=value_heads,
+            head_dim=value_dim,
+            rank=r,
+            world_size=n,
+        )
+
+    if key.endswith((".in_proj_b.weight", ".in_proj_a.weight", ".dt_bias", ".A_log")):
+        return _slice_heads(
+            value,
+            num_heads=value_heads,
+            head_dim=1,
+            rank=r,
+            world_size=n,
+        )
+
+    return None
+
+
+def _shard_tensor(key: str, value: torch.Tensor, r: int, n: int, config):
     """Extract rank r's shard from a single tensor. Returns a contiguous copy."""
+    if config.is_qwen3_5_moe:
+        sharded = _shard_qwen35_linear_attn_tensor(key, value, r, n, config)
+        if sharded is not None:
+            return sharded
+        if ".experts.gate_up_proj" in key:
+            return value.chunk(n, dim=1)[r].clone()
+        if ".experts.down_proj" in key:
+            return value.chunk(n, dim=2)[r].clone()
+
     if any(key.count(sub) for sub in _SPLIT_DIM_0):
         is_kv_proj = any(key.count(sub) for sub in (".k_proj", ".v_proj"))
-        if is_kv_proj and num_kv_heads is not None and num_kv_heads < n:
-            head_dim = value.shape[0] // num_kv_heads
-            head_idx = r * num_kv_heads // n
+        if is_kv_proj and config.num_kv_heads is not None and config.num_kv_heads < n:
+            head_dim = value.shape[0] // config.num_kv_heads
+            head_idx = r * config.num_kv_heads // n
             return value[head_idx * head_dim : (head_idx + 1) * head_dim].clone()
         return value.chunk(n, dim=0)[r].clone()
     elif any(key.count(sub) for sub in _SPLIT_DIM_1):
@@ -89,12 +178,21 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
     for file in tqdm(files, desc="Loading weights", disable=not tp_info.is_primary()):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for name in f.keys():
-                # Strip multimodal wrapper prefix, skip vision/projector weights
-                if name.startswith(("vision_tower.", "multi_modal_projector.")):
+                # Strip multimodal wrapper prefixes and skip vision/projector weights.
+                if name.startswith(
+                    (
+                        "vision_tower.",
+                        "multi_modal_projector.",
+                        "model.visual.",
+                        "visual.",
+                    )
+                ):
                     continue
                 raw = f.get_tensor(name)
                 name = name.removeprefix("language_model.")
-                tensor = _shard_tensor(name, raw, tp_info.rank, tp_info.size, config.num_kv_heads)
+                if name.startswith("model.language_model."):
+                    name = "model." + name.removeprefix("model.language_model.")
+                tensor = _shard_tensor(name, raw, tp_info.rank, tp_info.size, config)
                 del raw
 
                 if (info := _get_merge_info(name)) is None:

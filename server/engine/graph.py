@@ -22,6 +22,7 @@ class GraphCaptureBuffer:
     input_ids: torch.Tensor
     out_loc: torch.Tensor
     positions: torch.Tensor
+    table_idxs: torch.Tensor
     logits: torch.Tensor
 
     @classmethod
@@ -30,6 +31,7 @@ class GraphCaptureBuffer:
             input_ids=torch.zeros(bs, dtype=torch.int32, device=device),
             out_loc=torch.zeros(bs, dtype=torch.int32, device=device),
             positions=torch.zeros(bs, dtype=torch.int32, device=device),
+            table_idxs=torch.zeros(bs, dtype=torch.int64, device=device),
             logits=torch.empty(bs, vocab_size, dtype=torch.float32, device=device),
         )
 
@@ -38,12 +40,14 @@ class GraphCaptureBuffer:
         batch.input_ids = self.input_ids[_slice]
         batch.out_loc = self.out_loc[_slice]
         batch.positions = self.positions[_slice]
+        batch.table_idxs = self.table_idxs[_slice]
 
     def copy_from(self, batch: Batch) -> None:
         _slice = slice(batch.padded_size)
         self.input_ids[_slice] = batch.input_ids
         self.out_loc[_slice] = batch.out_loc
         self.positions[_slice] = batch.positions
+        self.table_idxs[_slice] = batch.table_idxs
 
 
 def _determine_cuda_graph_bs(
@@ -56,15 +60,13 @@ def _determine_cuda_graph_bs(
 
     free_memory_gb = free_memory / (1 << 30)
     if cuda_graph_max_bs is None:
-        if free_memory_gb > 80:  # H200
-            cuda_graph_max_bs = 256
-        else:
-            cuda_graph_max_bs = 160
+        cuda_graph_max_bs = 64 if free_memory_gb > 80 else 32
 
     if cuda_graph_max_bs < 1:
         return []
 
-    return [1, 2, 4] + list(range(8, cuda_graph_max_bs + 1, 8))
+    useful_sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+    return [bs for bs in useful_sizes if bs <= cuda_graph_max_bs]
 
 
 def mem_GB(size: int) -> str:

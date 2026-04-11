@@ -4,11 +4,11 @@ We have successfully engineered a custom inference engine bypassing high-level f
 
 ## Execution and Engine Architecture
 
-- **Custom API Server**: A FastAPI setup running `server/app.py` acts as the interface, fulfilling the `/v1/chat/completions` API requirement while queuing requests dynamically.
-- **Dynamic Micro-Batching Loop**: `server/engine.py` has been completely reworked. Instead of evaluating queries sequentially, its internal loop dynamically aggregates inbound API requests into padded `generate_batch` tensors up to `HACKATHON_MAX_BATCH_SIZE=64`, enabling massive concurrency improvements over the 64 tok/s baseline.
-- **`TPFusedMoeBackend`**: The core execution wrapper. It loads the Huggingface Model cleanly while parallelizing layers and replacing heavy modules to reduce overhead.
-- **Tensor Parallelism**: Natively integrates `torch.distributed.tensor.parallel` to split the computation of the `in_proj` and `out_proj` dense layers across all 8xH200 GPUs locally. This massively offsets the single-GPU memory bound limitation, matching the speedup that previously required full `minisgl` deployments.
-- **Triton Fused MoE Interpolation**: The kernel blocks in `server/custom_backend.py` seamlessly patch `Qwen3_5MoeSparseMoeBlock` instances with our ported `mini-sglang` `fused_moe_kernel_triton`. By fusing the expert parallel computation, we drastically prevent VRAM bandwidth fragmentation.
+- **Custom API Server**: The submission path now runs `python -m server`, the multi-process scheduler/tokenizer runtime. `server/app.py` remains only as a lightweight fallback.
+- **Harness-Compatible Responses**: `/health` and non-streaming `/v1/chat/completions` are served by the min-sglang frontend, with OpenAI-compatible `choices`, `finish_reason`, and `usage`.
+- **Native Qwen3.5 Runtime**: `Qwen3_5Moe*` routes to a dedicated runtime model with Qwen3.5 layer types, Gated DeltaNet, gated full attention, shared expert MoE, and centered RMSNorm.
+- **Tensor Parallelism**: Dense projections, MoE experts, DeltaNet heads, embeddings, and LM head are sharded across TP ranks while restoring full hidden states at layer boundaries.
+- **Scheduling / Memory**: Defaults are tuned for the benchmark shape: TP=8, max running requests 64, max sequence length 4096, prefill budget 8192, useful CUDA graph sizes, and naive prefix cache for DeltaNet correctness.
 
 ## Verification Instructions
 
@@ -17,16 +17,14 @@ Before submitting to the hackathon leaderboard, I recommend running the engine a
 > [!TIP]
 > **To start the new Engine locally:**
 > ```bash
-> export HACKATHON_BACKEND=tpfused
-> export HACKATHON_MAX_BATCH_SIZE=64
-> python -m server.app --host 0.0.0.0 --port 8000
+> ./prototype/start_min_server.sh
 > ```
 
 > [!IMPORTANT]
 > **Evaluations**:
-> Make sure to kill any legacy vLLM instances currently running via `./prototype/start_vllm.sh` on the node using `pkill -f vllm` so it can acquire all GPUs concurrently.
-> Test the throughput directly using:
+> This is a shared node. Do not kill unrelated processes or assume exclusive ownership of the machine while iterating on the backend.
+> Test throughput against an isolated port or isolated branch worktree using:
 > ```bash
 > python ./eval/throughput/run_throughput.py --base-url "http://127.0.0.1:8000" --concurrency 1 2 4 8 16 32 64
 > ```
-> Assuming strict equivalence, correctness gates will pass trivially as we utilize underlying Native configurations.
+> Correctness still needs to be revalidated after any kernel or scheduler change, especially around DeltaNet state updates, RoPE handling, and MoE routing.

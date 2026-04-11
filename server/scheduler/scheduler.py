@@ -56,8 +56,15 @@ class Scheduler(SchedulerIOMixin):
 
         # initialize other managers
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
+        cache_type = config.cache_type
+        if config.model_config.has_linear_attention and cache_type != "naive":
+            logger.warning_rank0(
+                "Overriding cache_type=%s to naive because Qwen3.5 DeltaNet state is not radix-cacheable yet.",
+                cache_type,
+            )
+            cache_type = "naive"
         self.cache_manager = CacheManager(
-            self.engine.num_pages, config.page_size, self.engine.page_table, config.cache_type
+            self.engine.num_pages, config.page_size, self.engine.page_table, cache_type
         )
         self.decode_manager = DecodeManager(config.page_size)
         self.prefill_manager = PrefillManager(
@@ -70,6 +77,8 @@ class Scheduler(SchedulerIOMixin):
         self.eos_token_id = self.tokenizer.eos_token_id
         self.token_pool = self.table_manager.token_pool
         self.prefill_budget = config.max_extend_tokens
+        self.decode_steps_between_prefills = config.decode_steps_between_prefills
+        self._decode_steps_since_prefill = 0
         # self.config = config
 
         # Initialize the I/O mixin
@@ -150,10 +159,21 @@ class Scheduler(SchedulerIOMixin):
                 next_token = next_tokens_cpu[i]
                 req.append_host(next_token.unsqueeze(0))
                 next_token = int(next_token.item())
-                finished = not req.can_decode
+                length_reached = not req.can_decode
+                finished = length_reached
                 if not req.sampling_params.ignore_eos:
                     finished |= next_token == self.eos_token_id
-                reply.append(DetokenizeMsg(uid=req.uid, next_token=next_token, finished=finished))
+                finish_reason = None
+                if finished:
+                    finish_reason = "length" if length_reached else "stop"
+                reply.append(
+                    DetokenizeMsg(
+                        uid=req.uid,
+                        next_token=next_token,
+                        finished=finished,
+                        finish_reason=finish_reason,
+                    )
+                )
 
                 # NOTE: overlap scheduling may make the request freed twice, skip second free
                 if finished and req not in self.finished_reqs:
@@ -198,12 +218,15 @@ class Scheduler(SchedulerIOMixin):
             raise NotImplementedError
 
     def _free_req_resources(self, req: Req) -> None:
+        if self.engine.ctx.delta_state_cache is not None:
+            self.engine.ctx.delta_state_cache.free(req.table_idx)
         self.table_manager.free(req.table_idx)
         self.cache_manager.cache_req(req, finished=True)
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
         self.cache_manager.allocate_paged(batch.reqs)
+        batch.table_idxs = _make_table_idxs(batch, self.device)
         batch.positions = _make_positions(batch, self.device)
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)
@@ -217,11 +240,28 @@ class Scheduler(SchedulerIOMixin):
         )
 
     def _schedule_next_batch(self) -> ForwardInput | None:
-        # TODO: support other policies: e.g. DECODE first
-        batch = (
-            self.prefill_manager.schedule_next_batch(self.prefill_budget)
-            or self.decode_manager.schedule_next_batch()
-        )
+        if self.decode_manager.runnable:
+            should_admit_prefill = (
+                self.prefill_manager.runnable
+                and self._decode_steps_since_prefill >= self.decode_steps_between_prefills
+            )
+            if should_admit_prefill:
+                batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
+                if batch is not None:
+                    self._decode_steps_since_prefill = 0
+                    logger.debug_rank0("Scheduled prefill batch size=%d", batch.size)
+                    return self._prepare_batch(batch)
+
+            batch = self.decode_manager.schedule_next_batch()
+            if batch is not None:
+                self._decode_steps_since_prefill += 1
+                logger.debug_rank0("Scheduled decode batch size=%d", batch.size)
+                return self._prepare_batch(batch)
+
+        batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
+        if batch is not None:
+            self._decode_steps_since_prefill = 0
+            logger.debug_rank0("Scheduled prefill batch size=%d", batch.size)
         return self._prepare_batch(batch) if batch else None
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
@@ -247,6 +287,11 @@ def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
         )
         offset += length
     return indices_host.to(device, non_blocking=True)
+
+
+def _make_table_idxs(batch: Batch, device: torch.device) -> torch.Tensor:
+    table_idxs = [req.table_idx for req in batch.padded_reqs]
+    return torch.tensor(table_idxs, dtype=torch.int64, pin_memory=True).to(device, non_blocking=True)
 
 
 def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:

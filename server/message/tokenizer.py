@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Literal
 
 from server.core import SamplingParams
 
@@ -29,6 +29,7 @@ class DetokenizeMsg(BaseTokenizerMsg):
     uid: int
     next_token: int
     finished: bool
+    finish_reason: Literal["stop", "length"] | None = None
 
 
 @dataclass

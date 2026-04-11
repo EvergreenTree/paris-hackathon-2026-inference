@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sys
 import time
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Literal, Tuple
@@ -21,7 +23,7 @@ from server.message import (
     TokenizeMsg,
     UserReply,
 )
-from server.utils import ZmqAsyncPullQueue, ZmqAsyncPushQueue, init_logger
+from server.utils import ZmqAsyncPullQueue, ZmqAsyncPushQueue, init_logger, load_tokenizer
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import WordCompleter
 from pydantic import BaseModel, Field
@@ -32,6 +34,8 @@ from .args import ServerArgs
 logger = init_logger(__name__, "FrontendAPI")
 
 _GLOBAL_STATE = None
+_THINK_TAG_RE = re.compile(r"<think>.*?</think>", flags=re.DOTALL | re.IGNORECASE)
+_THINK_BOUNDARY_RE = re.compile(r"</?think>", flags=re.IGNORECASE)
 
 
 def get_global_state() -> FrontendManager:
@@ -58,7 +62,7 @@ class GenerateRequest(BaseModel):
 
 
 class Message(BaseModel):
-    role: Literal["system", "user", "assistant"]
+    role: Literal["system", "user", "assistant", "tool"]
     content: str
 
 
@@ -71,7 +75,7 @@ class OpenAICompletionRequest(BaseModel):
     messages: List[Message] | None = None
 
     max_tokens: int = 16
-    temperature: float = 1.0
+    temperature: float = 0.0
 
     top_k: int = -1
     top_p: float = 1.0
@@ -102,6 +106,7 @@ class FrontendManager:
     config: ServerArgs
     send_tokenizer: ZmqAsyncPushQueue[BaseTokenizerMsg]
     recv_tokenizer: ZmqAsyncPullQueue[BaseFrontendMsg]
+    tokenizer: object
     uid_counter: int = 0
     initialized: bool = False
     ack_map: Dict[int, List[UserReply]] = field(default_factory=dict)
@@ -213,6 +218,37 @@ class FrontendManager:
         self.send_tokenizer.stop()
         self.recv_tokenizer.stop()
 
+    def render_prompt(self, prompt: str | List[Dict[str, str]]) -> str:
+        if isinstance(prompt, str):
+            return prompt
+        try:
+            rendered = self.tokenizer.apply_chat_template(
+                prompt,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        except TypeError:
+            rendered = self.tokenizer.apply_chat_template(
+                prompt,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        assert isinstance(rendered, str)
+        return rendered
+
+    def count_prompt_tokens(self, prompt: str | List[Dict[str, str]]) -> int:
+        rendered = self.render_prompt(prompt)
+        return len(self.tokenizer.encode(rendered, add_special_tokens=False))
+
+    def count_completion_tokens(self, text: str) -> int:
+        return len(self.tokenizer.encode(text, add_special_tokens=False))
+
+    def strip_thinking(self, text: str) -> str:
+        text = _THINK_TAG_RE.sub("", text)
+        text = _THINK_BOUNDARY_RE.sub("", text)
+        return text.strip()
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -253,6 +289,12 @@ async def v1_root():
     return {"status": "ok"}
 
 
+@app.get("/health")
+async def health():
+    state = get_global_state()
+    return {"status": "ok", "backend": "minisgl", "model": state.config.model_path}
+
+
 @app.post("/v1/chat/completions")
 async def v1_completions(req: OpenAICompletionRequest, request: Request):
     state = get_global_state()
@@ -278,10 +320,49 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
         )
     )
 
-    return StreamingResponse(
-        state.stream_with_cancellation(state.stream_chat_completions(uid), request, uid),
-        media_type="text/event-stream",
-    )
+    if req.stream:
+        return StreamingResponse(
+            state.stream_with_cancellation(state.stream_chat_completions(uid), request, uid),
+            media_type="text/event-stream",
+        )
+
+    content_parts: List[str] = []
+    finish_reason: Literal["stop", "length"] | None = None
+    async for ack in state.wait_for_ack(uid):
+        if await request.is_disconnected():
+            await state.abort_user(uid)
+            raise asyncio.CancelledError
+        content_parts.append(ack.incremental_output)
+        if ack.finished:
+            finish_reason = ack.finish_reason or "stop"
+            break
+
+    content = state.strip_thinking("".join(content_parts))
+    prompt_tokens = state.count_prompt_tokens(prompt)
+    completion_tokens = state.count_completion_tokens(content)
+    if finish_reason is None:
+        finish_reason = "length" if completion_tokens >= req.max_tokens else "stop"
+    elif finish_reason != "length" and completion_tokens >= req.max_tokens:
+        finish_reason = "length"
+
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": req.model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": finish_reason,
+            }
+        ],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+    }
 
 
 @app.get("/v1/models")
@@ -432,6 +513,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_sh
             create=config.frontend_create_tokenizer_link,
             encoder=BaseTokenizerMsg.encoder,
         ),
+        tokenizer=load_tokenizer(config.model_path),
     )
 
     # start the backend here

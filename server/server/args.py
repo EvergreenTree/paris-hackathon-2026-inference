@@ -171,6 +171,13 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
+        "--decode-steps-between-prefills",
+        type=int,
+        default=ServerArgs.decode_steps_between_prefills,
+        help="Decode-priority scheduler admits pending prefills after this many decode batches.",
+    )
+
+    parser.add_argument(
         "--num-pages",
         dest="num_page_override",
         type=int,

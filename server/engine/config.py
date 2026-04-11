@@ -17,17 +17,17 @@ class EngineConfig:
     model_path: str
     tp_info: DistributedInfo
     dtype: torch.dtype
-    max_running_req: int = 256
+    max_running_req: int = 64
     attention_backend: str = "auto"
     moe_backend: str = "auto"
     cuda_graph_bs: List[int] | None = None
-    cuda_graph_max_bs: int | None = None
+    cuda_graph_max_bs: int | None = 64
     page_size: int = 1
     memory_ratio: float = 0.9
     distributed_timeout: float = 60.0
     use_dummy_weight: bool = False
     use_pynccl: bool = True
-    max_seq_len_override: int | None = None
+    max_seq_len_override: int | None = 4096
     num_page_override: int | None = None  # if not None, will override the number of pages
 
     @cached_property

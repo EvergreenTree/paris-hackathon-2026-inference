@@ -10,8 +10,8 @@ It will:
 
 - install `uv` if needed
 - create `.venv`
-- install the local package plus missing `fastapi`, `uvicorn`, `transformers`, and `torch` deps
-- launch `prototype/min_server.py` on the requested port
+- install the local package plus the custom engine runtime dependencies
+- launch `python -m server` on the requested port with TP=8, BF16, max running requests 64, max sequence length 4096, and CUDA graph capture up to batch 64
 - verify `GET /health` and `POST /v1/chat/completions`
 
 Useful overrides:
@@ -20,7 +20,7 @@ Useful overrides:
 PORT=8001 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./prototype/start_min_server.sh
 ```
 
-`prototype/start_vllm.sh` is still available as the old vLLM reference launcher, but the restored prototype flow now points at `start_min_server.sh`.
+`prototype/start_vllm.sh` is still available as the old vLLM reference launcher, but the custom-engine flow now points at `start_min_server.sh`.
 
 ## Previous Metrics
 

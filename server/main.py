@@ -1,9 +1,7 @@
-import subprocess
-import sys
-
 def main():
-    print("Starting custom engine...")
-    subprocess.run([sys.executable, "-m", "server.app"] + sys.argv[1:])
+    from server.server import launch_server
+
+    launch_server()
 
 if __name__ == "__main__":
     main()

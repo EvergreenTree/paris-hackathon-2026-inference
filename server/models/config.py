@@ -32,10 +32,26 @@ class ModelConfig:
     norm_topk_prob: bool
     model_type: str
     architectures: list[str]
+    attention_bias: bool = False
+    layer_types: list[str] | None = None
+    linear_num_value_heads: int = 0
+    linear_num_key_heads: int = 0
+    linear_key_head_dim: int = 0
+    linear_value_head_dim: int = 0
+    linear_conv_kernel_dim: int = 0
+    shared_expert_intermediate_size: int = 0
 
     @property
     def is_moe(self) -> bool:
         return "moe" in self.model_type
+
+    @property
+    def is_qwen3_5_moe(self) -> bool:
+        return "qwen3_5" in self.model_type or any("Qwen3_5Moe" in a for a in self.architectures)
+
+    @property
+    def has_linear_attention(self) -> bool:
+        return bool(self.layer_types and "linear_attention" in self.layer_types)
 
     @classmethod
     def from_hf(cls, config: PretrainedConfig) -> ModelConfig:
@@ -55,6 +71,13 @@ class ModelConfig:
         moe_intermediate_size = getattr(config, "moe_intermediate_size", 0)
         norm_topk_prob = getattr(config, "norm_topk_prob", False)
         architectures = getattr(config, "architectures", ["LlamaForCausalLM"])
+        layer_types = getattr(config, "layer_types", None)
+        linear_num_value_heads = getattr(config, "linear_num_value_heads", 0)
+        linear_num_key_heads = getattr(config, "linear_num_key_heads", 0)
+        linear_key_head_dim = getattr(config, "linear_key_head_dim", 0)
+        linear_value_head_dim = getattr(config, "linear_value_head_dim", 0)
+        linear_conv_kernel_dim = getattr(config, "linear_conv_kernel_dim", 0)
+        shared_expert_intermediate_size = getattr(config, "shared_expert_intermediate_size", 0)
 
         # Llama/Qwen: rope_theta is a direct attr; Mistral: it's inside rope_scaling dict
         rope_scaling = getattr(config, "rope_scaling", None)
@@ -91,4 +114,12 @@ class ModelConfig:
             norm_topk_prob=norm_topk_prob,
             model_type=model_type,
             architectures=architectures,
+            attention_bias=getattr(config, "attention_bias", False),
+            layer_types=layer_types,
+            linear_num_value_heads=linear_num_value_heads,
+            linear_num_key_heads=linear_num_key_heads,
+            linear_key_head_dim=linear_key_head_dim,
+            linear_value_head_dim=linear_value_head_dim,
+            linear_conv_kernel_dim=linear_conv_kernel_dim,
+            shared_expert_intermediate_size=shared_expert_intermediate_size,
         )
